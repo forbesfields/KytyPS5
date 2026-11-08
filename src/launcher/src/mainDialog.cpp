@@ -193,7 +193,11 @@ void MainDialogPrivate::FindInterpreter() {
 	}
 
 	bool found = QFile::exists(m_interpreter);
+#if defined(__APPLE__)
+	m_ui->widget->SetRuntimeDirectory(QDir::currentPath());
+#else
 	m_ui->widget->SetRuntimeDirectory(QFileInfo(m_interpreter).absolutePath());
+#endif
 
 	if (found) {
 		m_ui->label_Interpreter->setText(tr("Emulator: ") + m_interpreter);
@@ -437,7 +441,11 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 	process->setNativeArguments(
 	    CmdCommand(QDir::toNativeSeparators(interpreter), args, close_terminal));
 #endif
+#if defined(__APPLE__)
+	process->setWorkingDirectory(QDir::currentPath());
+#else
 	process->setWorkingDirectory(QFileInfo(interpreter).absolutePath());
+#endif
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);

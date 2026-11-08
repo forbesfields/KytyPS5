@@ -2,10 +2,25 @@
 #include "launcherTheme.h"
 
 #include <QApplication>
+#include <QDir>
 #include <QIcon>
+#include <QMessageBox>
+#include <QSettings>
+#include <QStandardPaths>
 
 int main(int argc, char* argv[]) {
 	QApplication a(argc, argv);
+#if defined(__APPLE__)
+	// Keep writable state outside the signed app, including when macOS translocates it.
+	const auto runtime = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation))
+	                         .filePath(QStringLiteral("KytyPS5"));
+	if (!QDir().mkpath(runtime) || !QDir::setCurrent(runtime)) {
+		QMessageBox::critical(nullptr, QStringLiteral("KytyPS5"),
+		                      QStringLiteral("Cannot open the application data folder:\n%1").arg(runtime));
+		return 1;
+	}
+	QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, runtime);
+#endif
 	// Title bars and taskbars get the bolder small-size artwork.
 	const QIcon small_art(QStringLiteral(":/icons/kyty-small.svg"));
 	const QIcon large_art(QStringLiteral(":/icons/kyty.svg"));
