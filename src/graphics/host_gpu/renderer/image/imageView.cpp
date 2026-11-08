@@ -277,6 +277,10 @@ bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
 vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	const auto& image      = backing;
 	auto        normalized = view_info;
+#if defined(__APPLE__)
+	// MoltenVK has no image-view min-LOD clamp. Preserve view dimensions and texel queries.
+	normalized.min_lod = 0;
+#endif
 	const bool  is_storage = static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);
 	const auto  image_aspect = FullAspectMask(image.format);
 	if (image_aspect & vk::ImageAspectFlagBits::eDepth &&

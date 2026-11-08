@@ -896,7 +896,13 @@ SpirvStoredBuiltInElements(const std::vector<uint32_t> &binary,
                          member->second;
     if (const auto decorated = member_builtins.find(key);
         decorated != member_builtins.end() && decorated->second == builtin) {
-      elements.push_back(UINT32_MAX);
+      // An arrayed member (ClipDistance in gl_PerVertex) names the element
+      // with the second index.
+      const auto element = access->second.indices.size() > 1u
+                               ? constants.find(access->second.indices[1])
+                               : constants.end();
+      elements.push_back(element != constants.end() ? element->second
+                                                    : UINT32_MAX);
     }
   }
   std::sort(elements.begin(), elements.end());
@@ -1933,6 +1939,33 @@ void TestNggVertexEntryState() {
     CheckSpirvBinaryValidates(result.spirv);
   }
 }
+
+#if defined(__APPLE__)
+void TestMetalVertexLaunchMask() {
+  using namespace ShaderRecompiler;
+  // Extract the NGG vertex count and enable that many lanes before exporting the vertex ID.
+  const uint32_t code[] = {
+      EncodeSop2(0x0e, 0, 3, 255), 255u,
+      EncodeSop2(0x03, 106, 192, 0),
+      EncodeSop2(0x21, 126, 193, 106),
+      EncodeExp0(0x0c, 0xf), EncodeExp1(5, 5, 5, 5), EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo vertex{};
+  for (const uint32_t wave_size : {32u, 64u}) {
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.wave_size = wave_size;
+    options.input_info.vertex = &vertex;
+    const auto result = RecompileForTest(code, options);
+    Check(!result.program.info.subgroup_ballot &&
+              !result.program.info.subgroup_local_invocation_id,
+          "NGG launch mask needs unsupported Metal vertex subgroup builtins");
+    Check(std::ranges::any_of(result.program.info.outputs, [](const auto& output) {
+            return output.kind == IR::StageOutputKind::Position;
+          }), "NGG launch mask discarded the vertex position");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+#endif
 
 void TestNativeDataCacheInvalidation() {
   using namespace ShaderRecompiler;
@@ -8526,7 +8559,7 @@ void TestNewShaderRecompilerAuxPositionExports() {
                 std::vector<uint32_t>({0u, 1u, 2u}),
         "partial clip/cull exports or the appended clipping-error plane used the wrong elements");
   Check(SpirvHasDecorationValue(all.spirv, 11u, 1u) &&
-            SpirvHasDecorationValue(all.spirv, 11u, 3u) &&
+            SpirvHasMemberDecorationValue(all.spirv, 11u, 3u) &&
             SpirvHasDecorationValue(all.spirv, 11u, 4u) &&
             SpirvHasDecorationValue(all.spirv, 11u, 9u) &&
             SpirvContainsCapability(all.spirv, 32u) &&
@@ -13168,7 +13201,11 @@ void TestRepeatedExportsHaveOneInterface() {
     }
     offset += result.spirv[offset] >> spv::WordCountShift;
   }
-  Check(outputs == 2 && SpirvHasDecorationValue(result.spirv, 11u, 3u),
+  // Position and the clipping-error plane share the gl_PerVertex block.
+  const auto planes = SpirvStoredBuiltInElements(result.spirv, 3u);
+  Check(outputs == 1 && SpirvHasMemberDecorationValue(result.spirv, 11u, 3u) &&
+            !planes.empty() &&
+            std::ranges::all_of(planes, [](uint32_t e) { return e == 0u; }),
         "repeated exports duplicated Position or its clipping-error plane");
 }
 
@@ -13500,6 +13537,9 @@ int main() {
   TestVertexBufferGrouping();
   TestShaderProgramHash();
   TestNggVertexEntryState();
+#if defined(__APPLE__)
+  TestMetalVertexLaunchMask();
+#endif
   TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerAuxPositionExports();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();
