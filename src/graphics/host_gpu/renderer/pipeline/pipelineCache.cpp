@@ -711,8 +711,14 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		                         .buffer_format != Prospero::BufferFormat::k32UInt);
 	}
 	if (mesh_active) {
-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
 		auto& mesh              = vertex_info[0].mesh;
+		if (!m_graphics.mesh_shader_enabled) {
+			EXIT("This game requires mesh shaders, but the selected Vulkan device does not support "
+			     "VK_EXT_mesh_shader and no mesh emulation backend is available. "
+			     "shader=0x%016" PRIx64 " threads=%u vertices=%u primitives=%u fast_launch=%u\n",
+			     vertex_params[0].hash, mesh.threads_num[0], mesh.max_vertices,
+			     mesh.max_primitives, static_cast<uint32_t>(mesh.fast_launch));
+		}
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;
 		const auto  logical_threads =

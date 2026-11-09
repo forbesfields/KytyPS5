@@ -742,6 +742,10 @@ if(BUILD_TESTING)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME shader_null_image_specialization
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --null-image-specialization-only)
+	add_test(NAME shader_null_image_shape
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --null-image-specialization-only)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_float_min_max

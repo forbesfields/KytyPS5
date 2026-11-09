@@ -1427,6 +1427,79 @@ void TestIndirectImageSamplerClasses(bool mixed) {
   }
 }
 
+void TestIndirectNullImageRefresh(uint32_t null_ordinal) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::Prospero::BufferFormat;
+  auto program = MixedSamplerProgram();
+  auto &block = *program.blocks.front();
+  auto &base = block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(2))});
+  const auto extra = static_cast<uint32_t>(program.descriptor_sources.size());
+  program.descriptor_sources.push_back(program.descriptor_sources[0]);
+  const std::array<uint32_t, 3> sources{0u, 1u, extra};
+  for (uint32_t ordinal = 0; ordinal < sources.size(); ++ordinal) {
+    auto &source = program.descriptor_sources[sources[ordinal]];
+    source.dwords[0] = ordinal == null_ordinal ? Value(&base) : Value(0x100u + ordinal);
+    source.dwords[1] = Value(static_cast<uint32_t>(BufferFormat::k8UNorm) << 20u);
+    source.dwords[3] = program.descriptor_sources[1].dwords[3];
+  }
+  DescriptorSource root;
+  root.dword_count = 8;
+  root.dwords.fill(Value(0u));
+  root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources =
+      {sources[0], sources[1], sources[2], sources[0]};
+  program.info.images.resize(1);
+  program.info.images[0].source = static_cast<uint32_t>(program.descriptor_sources.size());
+  program.descriptor_sources.push_back(root);
+  program.info.samplers.resize(1);
+  program.info.sampled_pairs.resize(1);
+  const auto plan = Extract(program);
+  std::array<uint32_t, 3> user_data{};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const SrtRuntime runtime{.user_data = user_data};
+  const auto materialize = [&] {
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "indirect null image refresh failed");
+    Check(snapshot.images.size() == 3u && specialization.images.size() == 3u,
+          "an indirect null candidate changed the table size");
+    const auto offset = specialization.images[0].indirect_mapping_offset;
+    Check(snapshot.flattened_srt[offset] == 4u &&
+              snapshot.flattened_srt[offset + 2u] == 0u &&
+              snapshot.flattened_srt[offset + 4u] == 1u &&
+              snapshot.flattened_srt[offset + 6u] == 2u &&
+              snapshot.flattened_srt[offset + 8u] == 0u,
+          "an indirect null candidate changed selector ordinals");
+  };
+  materialize();
+  const auto null_specialization = specialization;
+  Writer writer;
+  Io(writer, specialization);
+  Reader reader{writer.bytes};
+  ResourceSpecialization cached;
+  Io(reader, cached);
+  Check(reader.ok && reader.bytes.empty() && cached == specialization,
+        "the shader cache lost an indirect null image specialization");
+#if defined(__APPLE__)
+  Check(specialization.images[null_ordinal].is_null,
+        "an indirect null candidate still requires a native descriptor");
+#endif
+  ApplyResourceSpecialization(program, specialization);
+  Check(program.info.images[0].indirect_resources == std::vector<uint32_t>({0u, 1u, 2u}),
+        "an indirect null root lost its candidate list");
+  user_data[2] = 0x200u;
+  materialize();
+  Check(!specialization.images[null_ordinal].is_null,
+        "a refreshed valid candidate retained its null specialization");
+#if defined(__APPLE__)
+  Check(specialization != null_specialization,
+        "null and valid image tables share a shader cache key");
+#endif
+  user_data[2] = 0u;
+  materialize();
+  Check(specialization == null_specialization,
+        "restoring a null image did not restore its shader specialization");
+}
+
 void TestShaderCacheRecords() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   // Equivalent selector domains share one key group, which a load rebuilds.
@@ -1503,6 +1576,7 @@ int main() {
   TestSignedStorageSpecialization();
   for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
+  for (uint32_t ordinal = 0; ordinal < 3u; ++ordinal) TestIndirectNullImageRefresh(ordinal);
   TestShaderCacheRecords();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;

@@ -12375,13 +12375,15 @@ public:
           PreparedBindings bindings;
           executor.PrepareBindings(input.stage, bindings);
           executor.RebindImages(bindings);
-          Require(name, "native null image bindings", !bindings.images.empty() &&
+          Require(name, "null image bindings", !bindings.images.empty() &&
               std::ranges::all_of(bindings.images, [](const auto &binding) {
                 return !binding.image_id && binding.image_view == nullptr &&
                     binding.mip_views.empty() &&
-                    MakeImageInfo(binding).imageView == nullptr &&
                     binding.layout == vk::ImageLayout::eGeneral;
-              }), "an all-zero guest descriptor allocated or bound a backing image");
+              }) && std::ranges::all_of(input.stage.module->info.info.images,
+                  [](const auto &image) {
+                    return image.is_null == (image.descriptor_index == UINT32_MAX);
+                  }), "an all-zero guest descriptor allocated or bound a backing image");
           processor.DispatchDirect(1, 1, 1, 0x41u |
               (wave_size == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
         }
@@ -52294,6 +52296,107 @@ void CheckStorageTextureDepthTileUploadLayout() {
   std::printf("[host]    %-32s ok\n", "StorageTextureDepthTileUpload");
 }
 
+void CheckNullImageSpecialization() {
+  using namespace ShaderRecompiler::IR;
+  for (u32 wave : {32u, 64u}) {
+    for (auto test : {ImageLoadVariants(), ImageSampleAndGather(), ImageStoreVariants(),
+                      ImageGetResinfoDmaskWidthHeight(), ImageGetResinfoDmaskMipLevels(),
+                      ImageAtomicCompareSwapGlcAndExec(), ImageAtomicVariants<true>(),
+                      ImageAtomicIntegerGlcAndExec(ImageAtomicIntegerCases[1], true)}) {
+      test.user_data = {};
+      test.has_user_data = true;
+      test.compute_info.wave_size = wave;
+      test.has_compute_info = true;
+      test.required_spirv.clear();
+      test.forbidden_spirv.clear();
+#if defined(__APPLE__)
+      test.forbidden_spirv = {"OpTypeImage", "OpImageFetch", "OpImageSample", "OpImageWrite",
+                              "OpImageTexelPointer", "Int64ImageEXT", "Int64Atomics"};
+#endif
+      const auto compiled = CompileCase(test, 32u);
+      Require(test.name, "null image resources", !compiled.program.info.images.empty(),
+              "null image instructions disappeared before specialization was tested");
+#if defined(__APPLE__)
+      Require(test.name, "no native null descriptors",
+              std::ranges::all_of(compiled.program.info.images, [](const auto &image) {
+                return image.is_null && image.descriptor_index == UINT32_MAX;
+              }), "a null image still requires a native descriptor");
+      for (u32 kind = 0; kind < static_cast<u32>(DescriptorBindingKind::Count); ++kind) {
+        if (ImageBindingResourceClass(static_cast<DescriptorBindingKind>(kind)) !=
+            ImageResourceClass::None) {
+          Require(test.name, "empty image layout",
+                  compiled.program.bindings.descriptor_counts[kind] == 0u,
+                  "null images left a hole in the native descriptor layout");
+        }
+      }
+#endif
+      std::printf("[null-image] %s wave=%u ok\n", test.name, wave);
+    }
+  }
+  auto valid = ImageLoadVariants();
+  valid.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  valid.has_user_data = true;
+  const auto compiled = CompileCase(valid, 32u);
+  Require(valid.name, "non-null control",
+          std::ranges::any_of(compiled.program.info.images, [](const auto &image) {
+            return !image.is_null && image.descriptor_index != UINT32_MAX;
+          }), "a valid image was removed from the descriptor layout");
+#if defined(__APPLE__)
+  for (u32 null_ordinal = 0; null_ordinal < 3u; ++null_ordinal) {
+    auto sample = ImageSampleAndGather();
+    sample.user_data = valid.user_data;
+    sample.has_user_data = true;
+    auto indirect = CompileCase(sample, 32u);
+    auto &program = indirect.program;
+    Require(sample.name, "indirect fixture", program.info.images.size() == 1u,
+            "the fixture requires one image root");
+    auto root = program.info.images[0];
+    root.indirect_root = 0u;
+    root.indirect_resources = {0u, 1u, 2u};
+    root.indirect_search_iterations = 0u;
+    root.indirect_mapping_offset = 0u;
+    // A real candidate has constant-one alpha; a null candidate must still return zero bits.
+    root.shader_swizzle = 4u | (5u << 3u) | (6u << 6u) | (1u << 9u);
+    auto candidate = root;
+    candidate.indirect_resources.clear();
+    program.info.images = {root, candidate, candidate};
+    program.info.images[null_ordinal].is_null = true;
+    program.descriptor_sources[root.source].indirect_descriptor.emplace();
+    program.shader_info_complete = false;
+    ShaderComputeInputInfo compute{};
+    compute.host_subgroup_size = 32u;
+    CollectShaderInfo(program, {.compute = &compute});
+    const auto spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+    ValidateSpirv("IndirectNullImage", spirv);
+    u32 slot = 0u;
+    for (u32 ordinal = 0; ordinal < 3u; ++ordinal) {
+      Require(sample.name, "dense non-null slots",
+              program.info.images[ordinal].descriptor_index ==
+                  (ordinal == null_ordinal ? UINT32_MAX : slot++),
+              "a null candidate shifted or occupied a real descriptor slot");
+    }
+    u32 uint_type = 0u, bits_type = 0u, zero_bits = 0u;
+    bool zero_join = false;
+    for (size_t offset = 5; offset < spirv.size();) {
+      const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+      const auto op = static_cast<spv::Op>(words[0] & 0xffffu);
+      if (op == spv::OpTypeInt && words[2] == 32u && words[3] == 0u) uint_type = words[1];
+      if (op == spv::OpTypeVector && words[2] == uint_type && words[3] == 4u)
+        bits_type = words[1];
+      if (op == spv::OpConstantNull && words[1] == bits_type) zero_bits = words[2];
+      if (op == spv::OpPhi && words[1] == bits_type && zero_bits != 0u) {
+        for (size_t incoming = 3; incoming < words.size(); incoming += 2u)
+          zero_join |= words[incoming] == zero_bits;
+      }
+      offset += words.size();
+    }
+    Require(sample.name, "null register bits", zero_join,
+            "the null branch did not join as zero register bits before constant swizzles");
+    std::printf("[null-image] indirect null ordinal=%u ok\n", null_ordinal);
+  }
+#endif
+}
+
 void CheckImageSamplerSpecialization() {
   ShaderSamplerResource filtered_sampler{};
   filtered_sampler.fields[2] =
@@ -55705,6 +55808,10 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--null-image-specialization-only") == 0) {
+    CheckNullImageSpecialization();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMulHi24(32));
