@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/gpuWorkLog.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -267,6 +268,24 @@ static bool HasStorageWrites(const ShaderComputeInputInfo& input_info,
 	       });
 }
 
+// Records a dispatch for the stall report; in isolation mode the GPU finishes it first.
+static void TraceDispatch(RenderContext& context, CommandBuffer& buffer, char kind,
+                          uint64_t shader_hash, vk::Pipeline pipeline, uint64_t workgroups) {
+	if (!GpuWorkLog::TraceEnabled()) {
+		return;
+	}
+	GpuWorkLog::Work work;
+	work.kind       = kind;
+	work.shaders[2] = shader_hash;
+	work.pipeline   = reinterpret_cast<uint64_t>(static_cast<VkPipeline>(pipeline));
+	work.elements   = workgroups;
+	auto& scheduler = context.GetCommandScheduler();
+	if (GpuWorkLog::Record(scheduler.CurrentTick(), work)) {
+		buffer.EndRendering();
+		scheduler.Wait(scheduler.CurrentTick());
+	}
+}
+
 void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x,
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
                                     bool async_compute) {
@@ -338,6 +357,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 
 	const auto& program   = input_info.stage.module->info;
 	const auto& resources = *input_info.stage.resources;
+	if (GpuWorkLog::ShouldSkip(program.shader_hash)) {
+		ResetBindings();
+		return;
+	}
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
@@ -470,6 +493,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	TraceDispatch(m_context, buffer, 'C', program.shader_hash, pipeline.pipeline,
+	              uint64_t {thread_group_x} * thread_group_y * thread_group_z);
 }
 
 void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
@@ -493,6 +518,10 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	input_info.indirect_args_address = args_addr;
 	m_context.GetImageHeap().BeginDraw();
 	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
+	if (GpuWorkLog::ShouldSkip(input_info.stage.module->info.shader_hash)) {
+		ResetBindings();
+		return;
+	}
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
 	auto& bindings = m_compute_bindings;
@@ -533,6 +562,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	TraceDispatch(m_context, buffer, 'I', program.shader_hash, pipeline.pipeline, 0);
 }
 
 } // namespace Libs::Graphics

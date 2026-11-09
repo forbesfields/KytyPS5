@@ -3,6 +3,9 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuWorkLog.h"
+
+#include <chrono>
 
 namespace Libs::Graphics {
 
@@ -50,8 +53,27 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// Wait in slices so that GPU work which never finishes is reported instead of blocking
+	// silently. The first report comes after 5 s, later ones every 30 s.
+	constexpr uint64_t SLICE_NS        = 1'000'000'000;
+	constexpr double   FIRST_REPORT_S  = 5.0;
+	constexpr double   REPORT_PERIOD_S = 30.0;
+	const auto         start           = std::chrono::steady_clock::now();
+	double             next_report     = FIRST_REPORT_S;
+	for (;;) {
+		const auto result = m_graphics.device.waitSemaphores(&wait_info, SLICE_NS);
+		if (result == vk::Result::eSuccess) {
+			break;
+		}
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eTimeout);
+		const double waited =
+		    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+		if (waited >= next_report) {
+			Refresh();
+			GpuWorkLog::ReportStall(tick, KnownGpuTick(), waited);
+			next_report = waited + REPORT_PERIOD_S;
+		}
+	}
 	Refresh();
 }
 
