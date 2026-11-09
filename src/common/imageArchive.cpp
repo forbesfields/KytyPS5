@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <span>
 #include <string>
@@ -142,12 +144,23 @@ private:
 	uint64_t valid;
 };
 
+// One cache for the whole archive, including nested images and per-file PFSC streams.
+// Sixteen blocks retain at most 16 MiB, independent of the number of files touched.
+struct BlockCache {
+	using Key                   = std::pair<uint64_t, uint64_t>;
+	uint64_t             nextId = 0;
+	std::map<Key, Bytes> entries;
+	std::deque<Key>      order;
+};
+
 class PfscImage final: public Image {
 public:
-	static ImagePtr Open(ImagePtr source) {
-		auto result    = std::make_shared<PfscImage>();
-		result->source = std::move(source);
-		const auto h   = result->source->Get(0, 0x30);
+	static ImagePtr Open(ImagePtr source, const std::shared_ptr<BlockCache>& cache) {
+		auto result     = std::make_shared<PfscImage>();
+		result->source  = std::move(source);
+		result->cache   = cache;
+		result->cacheId = cache->nextId++;
+		const auto h    = result->source->Get(0, 0x30);
 		if (h.empty() || std::memcmp(h.data(), "PFSC", 4) != 0) return {};
 		result->unit = U32(h, 12);
 		result->size = U64(h, 40);
@@ -175,9 +188,10 @@ public:
 	bool Read(uint64_t offset, std::span<uint8_t> output) override {
 		if (!Range(size, offset, output.size())) return false;
 		while (!output.empty()) {
-			const auto index = offset / unit, inside = offset % unit;
-			auto       entry = cache.find(index);
-			if (entry == cache.end()) {
+			const auto            index = offset / unit, inside = offset % unit;
+			const BlockCache::Key key {cacheId, index};
+			auto                  entry = cache->entries.find(key);
+			if (entry == cache->entries.end()) {
 				auto stored = source->Get(offsets[index], offsets[index + 1] - offsets[index]);
 				if (stored.empty()) return false;
 				Bytes decoded(unit);
@@ -196,12 +210,12 @@ public:
 					inflateEnd(&stream);
 					if (!valid) return false;
 				}
-				if (cache.size() == 16) {
-					cache.erase(order.front());
-					order.pop_front();
+				if (cache->entries.size() == 16) {
+					cache->entries.erase(cache->order.front());
+					cache->order.pop_front();
 				}
-				entry = cache.emplace(index, std::move(decoded)).first;
-				order.push_back(index);
+				entry = cache->entries.emplace(key, std::move(decoded)).first;
+				cache->order.push_back(key);
 			}
 			const auto take = std::min<uint64_t>(unit - inside, output.size());
 			std::memcpy(output.data(), entry->second.data() + inside, take);
@@ -212,11 +226,11 @@ public:
 	}
 
 private:
-	ImagePtr                            source;
-	uint64_t                            unit = 0;
-	std::vector<uint64_t>               offsets;
-	std::unordered_map<uint64_t, Bytes> cache;
-	std::deque<uint64_t>                order;
+	ImagePtr                    source;
+	uint64_t                    unit = 0;
+	std::vector<uint64_t>       offsets;
+	std::shared_ptr<BlockCache> cache;
+	uint64_t                    cacheId = 0;
 };
 
 bool SafeName(std::string_view name) {
@@ -239,7 +253,8 @@ using Members = std::vector<Member>;
 
 class PfsTree {
 public:
-	explicit PfsTree(ImagePtr image): image(std::move(image)) {}
+	PfsTree(ImagePtr image, std::shared_ptr<BlockCache> cache)
+	    : image(std::move(image)), cache(std::move(cache)) {}
 	bool Parse(Members& files) {
 		const auto h = image->Get(0, 0x380);
 		if (h.empty() || (U64(h, 0) != 1 && U64(h, 0) != 2) || U64(h, 8) != 20130315) return false;
@@ -337,7 +352,7 @@ private:
 			stored = std::make_shared<ChainImage>(image, unit, std::move(chain), node.size);
 		}
 		if (!stored || (node.flags & 1) == 0) return stored;
-		auto decoded = PfscImage::Open(stored);
+		auto decoded = PfscImage::Open(stored, cache);
 		return decoded && node.logical != 0 ? Slice(decoded, 0, node.logical) : nullptr;
 	}
 	bool Directory(uint32_t inode, std::vector<DirEntry>& entries) {
@@ -388,7 +403,8 @@ private:
 		return true;
 	}
 	ImagePtr                     image;
-	uint64_t                     unit        = 0;
+	uint64_t                     unit = 0;
+	std::shared_ptr<BlockCache>  cache;
 	bool                         signedNodes = false, wide = false;
 	std::vector<Node>            nodes;
 	std::unordered_set<uint32_t> visited;
@@ -537,28 +553,28 @@ private:
 	std::unordered_set<uint32_t> visited;
 };
 
-bool ReadTree(ImagePtr image, Members& files, unsigned depth = 0) {
+bool ReadTree(ImagePtr image, Members& files, const std::shared_ptr<BlockCache>& cache,
+              unsigned depth = 0) {
 	if (depth > 4) return false;
 	const auto header = image->Get(0, 16);
 	if (header.empty()) return false;
 	if (std::memcmp(header.data(), "PFSC", 4) == 0) {
-		auto decoded = PfscImage::Open(std::move(image));
-		return decoded && ReadTree(std::move(decoded), files, depth + 1);
+		auto decoded = PfscImage::Open(std::move(image), cache);
+		return decoded && ReadTree(std::move(decoded), files, cache, depth + 1);
 	}
 	if (std::memcmp(header.data() + 3, "EXFAT   ", 8) == 0)
 		return ExfatTree(std::move(image)).Parse(files);
 	Members outer;
-	if (!PfsTree(std::move(image)).Parse(outer)) return false;
+	if (!PfsTree(std::move(image), cache).Parse(outer)) return false;
 	ImagePtr inner;
 	for (const auto& entry: outer) {
 		const auto name = Key(entry.path);
-		if (name == "pfs_image.dat" || name.ends_with(".exfat") || name.ends_with(".ffpkg") ||
-		    name.ends_with(".ffpfs")) {
+		if (entry.data && (name == "pfs_image.dat" || name.ends_with(".exfat"))) {
 			if (inner) return false;
 			inner = entry.data;
 		}
 	}
-	if (inner) return ReadTree(std::move(inner), files, depth + 1);
+	if (inner) return ReadTree(std::move(inner), files, cache, depth + 1);
 	files = std::move(outer);
 	return true;
 }
@@ -567,7 +583,8 @@ class ImageArchive final: public ArchiveReader {
 public:
 	bool Open(const std::filesystem::path& path) {
 		Members files;
-		if (!ReadTree(std::make_shared<HostImage>(path), files)) return false;
+		if (!ReadTree(std::make_shared<HostImage>(path), files, std::make_shared<BlockCache>()))
+			return false;
 		nodes.push_back({{}, {}, {}});
 		lookup.emplace("", 0);
 		for (auto& file: files) {
@@ -620,8 +637,14 @@ public:
 		const auto take = std::min<uint64_t>(length, source->size - offset);
 		// Metadata is immutable. Serialize access to host cursors and the decompression caches.
 		std::lock_guard lock(mutex);
-		return source->Read(offset, {static_cast<uint8_t*>(data), static_cast<size_t>(take)}) ? take
-		                                                                                      : 0;
+		if (source->Read(offset, {static_cast<uint8_t*>(data), static_cast<size_t>(take)}))
+			return take;
+		if (!loggedReadError) {
+			std::fprintf(stderr, "FFPFSC: corrupt or unreadable member '%s' at offset %llu\n",
+			             nodes[id].name.c_str(), static_cast<unsigned long long>(offset));
+			loggedReadError = true;
+		}
+		return 0;
 	}
 
 private:
@@ -633,6 +656,7 @@ private:
 	std::vector<Node>                         nodes;
 	std::unordered_map<std::string, uint64_t> lookup;
 	std::mutex                                mutex;
+	bool                                      loggedReadError = false;
 };
 
 } // namespace
