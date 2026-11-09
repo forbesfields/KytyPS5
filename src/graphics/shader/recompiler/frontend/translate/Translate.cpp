@@ -1164,6 +1164,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		entry_ir.SetExecLo(initial_lo);
 		entry_ir.SetExecHi(initial_hi);
 		const auto active_lane_count = [&] {
+#if defined(__APPLE__)
+			// Metal runs vertex invocations independently and has no vertex-stage ballot.
+			// NGG launch masks cover every invocation Vulkan actually launches.
+			if (options.stage == ShaderType::Vertex) {
+				return IR::U32(IR::Value(options.wave_size));
+			}
+#endif
 			auto count = IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32, {initial_lo}));
 			if (options.wave_size == 64u) {
 				count = entry_ir.IAdd(count, IR::U32(entry_ir.Emit(

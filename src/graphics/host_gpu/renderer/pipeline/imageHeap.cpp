@@ -75,6 +75,11 @@ size_t ImageHeap::DescriptorHash::operator()(const DescriptorValue& value) const
 ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
     : m_context(context), m_page_manager(page_manager) {
 	auto& graphics = context.GetGraphics();
+#if defined(__APPLE__)
+	// MoltenVK has no native null descriptors for the reserved heap element.
+	// Materialize indirect images as ordinary typed bindings instead.
+	return;
+#endif
 	vk::PhysicalDeviceVulkan12Properties limits {};
 	vk::PhysicalDeviceProperties2        properties {};
 	properties.pNext = &limits;
@@ -131,6 +136,7 @@ ImageHeap::~ImageHeap() {
 }
 
 bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) {
+	if (m_layout == nullptr) return false;
 	KYTY_PROFILER_FUNCTION();
 	const auto size = request.size & ~uint64_t {3};
 	if (request.count == 0u || request.step == 0u ||

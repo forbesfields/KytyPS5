@@ -330,6 +330,10 @@ guest code; no manual signing step is required. When the launcher is built, the 
 also produces `_Build/macos/install/KytyPS5.app` — double-click to launch the GUI.
 A flat `kyty_emulator` is kept for CLI usage.
 
+The macOS launcher keeps save data, caches and settings in
+`~/Library/Application Support/KytyPS5`, outside the signed app bundle. To keep saves from an
+older portable installation, copy its `_SaveData` directory there before launching a game.
+
 Vulkan comes from MoltenVK. Download `MoltenVK-macos.tar` from the
 [MoltenVK releases](https://github.com/KhronosGroup/MoltenVK/releases), then copy
 `MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to the flat `kyty_emulator`

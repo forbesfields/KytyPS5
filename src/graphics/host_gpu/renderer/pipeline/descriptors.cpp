@@ -70,6 +70,9 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t element) {
 	if (!texture.image_id) {
 		EXIT_IF(texture.image_view != nullptr || !texture.mip_views.empty());
+#if defined(__APPLE__)
+		EXIT("null texture descriptors are unsupported on macOS\n");
+#endif
 		return {nullptr, nullptr, vk::ImageLayout::eGeneral};
 	}
 	vk::ImageView view = nullptr;
@@ -114,7 +117,13 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto& [address, size, id] = source;
 	if (address == 0 || size == 0) {
 		// Null descriptors read zero and drop writes, with or without shader bounds checks.
+#if defined(__APPLE__)
+		// Put every access past a real buffer's range when nullDescriptor is unavailable.
+		buffer_offset = 16;
+		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
+#else
 		return {nullptr, 0, vk::WholeSize};
+#endif
 	}
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();

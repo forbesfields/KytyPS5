@@ -53,7 +53,9 @@ vk::PhysicalDeviceVulkan11Features WindowContext::RequiredVulkan11Features() noe
 vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noexcept {
 	return {.samplerMirrorClampToEdge                     = VK_TRUE,
 	        .storageBuffer8BitAccess                      = VK_TRUE,
+#if !defined(__APPLE__)
 	        .shaderBufferInt64Atomics                     = VK_TRUE,
+#endif
 	        .shaderSampledImageArrayNonUniformIndexing    = VK_TRUE,
 	        .shaderStorageBufferArrayNonUniformIndexing   = VK_TRUE,
 	        .shaderStorageImageArrayNonUniformIndexing    = VK_TRUE,
@@ -212,7 +214,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			}
 		};
 
+#if !defined(__APPLE__)
 		check_feature(min_lod.minLod, "image view minLod");
+#endif
 
 		check_feature(clip_control.depthClipControl, "depthClipControl");
 #if defined(__APPLE__)
@@ -234,7 +238,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(features12.shaderOutputLayer, "shaderOutputLayer");
 		check_feature(features12.shaderOutputViewportIndex, "shaderOutputViewportIndex");
 		check_feature(features12.bufferDeviceAddress, "bufferDeviceAddress");
+#if !defined(__APPLE__)
 		check_feature(features12.shaderBufferInt64Atomics, "shaderBufferInt64Atomics");
+#endif
 		check_feature(features12.shaderSampledImageArrayNonUniformIndexing,
 		              "shaderSampledImageArrayNonUniformIndexing");
 		check_feature(features12.shaderStorageImageArrayNonUniformIndexing,
@@ -248,13 +254,17 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(features12.descriptorBindingPartiallyBound,
 		              "descriptorBindingPartiallyBound");
 		check_feature(features13.robustImageAccess, "robustImageAccess");
+#if !defined(__APPLE__)
 		check_feature(robustness2.nullDescriptor, "nullDescriptor");
+#endif
 		check_feature(features13.dynamicRendering, "dynamicRendering");
 		check_feature(features13.synchronization2, "synchronization2");
 		check_feature(device_features2.features.sampleRateShading, "sampleRateShading");
 		check_feature(device_features2.features.depthBiasClamp, "depthBiasClamp");
 		check_feature(device_features2.features.shaderClipDistance, "shaderClipDistance");
+#if !defined(__APPLE__)
 		check_feature(device_features2.features.shaderCullDistance, "shaderCullDistance");
+#endif
 		check_feature(device_features2.features.largePoints, "largePoints");
 		check_feature(device_features2.features.multiViewport, "multiViewport");
 		check_feature(device_features2.features.fillModeNonSolid, "fillModeNonSolid");
@@ -446,6 +456,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 	graphics.sampler_filter_minmax_enabled      = supported12.samplerFilterMinmax;
+#if defined(__APPLE__)
+	Log::WriteToConsoleAndLog(
+	    "macOS: min-LOD is ignored and null buffers use bounds checks; "
+	    "64-bit buffer atomics, cull distances and null textures remain unsupported.\n");
+#endif
 
 	auto features12                     = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
@@ -544,7 +559,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	device_features.sampleRateShading                    = VK_TRUE;
 	device_features.depthBiasClamp                       = VK_TRUE;
 	device_features.shaderClipDistance                   = VK_TRUE;
+#if !defined(__APPLE__)
 	device_features.shaderCullDistance                   = VK_TRUE;
+#endif
 	device_features.largePoints                          = VK_TRUE;
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
@@ -609,6 +626,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 #if defined(__APPLE__)
 	// MoltenVK lacks these extensions (see CreateVulkan).
+	create.unlink<vk::PhysicalDeviceImageViewMinLodFeaturesEXT>();
 	create.unlink<vk::PhysicalDeviceDepthClipEnableFeaturesEXT>();
 	create.unlink<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
 #else
@@ -900,7 +918,7 @@ void WindowContext::CreateVulkan() {
 
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+	    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
 	    VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, "VK_KHR_maintenance1"};
 
 #if defined(__APPLE__)
@@ -908,6 +926,7 @@ void WindowContext::CreateVulkan() {
 	// on macOS. It also requires VK_KHR_portability_subset per the Vulkan portability spec.
 	device_extensions.push_back("VK_KHR_portability_subset");
 #else
+	device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 #endif
 

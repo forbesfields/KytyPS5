@@ -114,6 +114,12 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 		     samplers, limits.maxDescriptorSetSamplers);
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+#if defined(__APPLE__)
+	// MoltenVK 1.4.1+ leaves buffer-size metadata stale with push descriptors.
+	if (graphics.GetPhysicalDeviceProperties().driverVersion >= 10401) {
+		pipeline.uses_push_descriptors = false;
+	}
+#endif
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors
@@ -162,7 +168,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (rect_list) {
 		std::span<const RectListParameter> parameters;
 		if (pixel != nullptr) parameters = pixel->rect_parameters;
-		const auto shaders = BuildRectListShaders(parameters, vertex.info.param_export_mask);
+		const auto shaders = BuildRectListShaders(parameters, vertex.info.param_export_mask,
+		                                          RectListClipDistances(vertex.info));
 		tess_control_shader_module = CompileSPV(shaders.control, graphics.device);
 		tess_eval_shader_module    = CompileSPV(shaders.evaluation, graphics.device);
 	}

@@ -376,8 +376,14 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 	const auto&      blend = ctx.GetBlendColor();
 	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
 	dynamic_state.SetBlendConstants(blend_constants);
+#if defined(__APPLE__)
+	// Metal requires depth testing and writes to be disabled without a depth attachment.
+	dynamic_state.SetDepthTestEnabled(depth.depth_test_enable && static_cast<bool>(depth.image_id));
+	dynamic_state.SetDepthWriteEnabled(depth.depth_write_enable && static_cast<bool>(depth.image_id));
+#else
 	dynamic_state.SetDepthTestEnabled(depth.depth_test_enable);
 	dynamic_state.SetDepthWriteEnabled(depth.depth_write_enable);
+#endif
 	dynamic_state.SetDepthCompareOp(depth.depth_compare_op);
 #if !defined(__APPLE__)
 	dynamic_state.SetDepthBoundsTestEnabled(depth.depth_bounds_test_enable);
