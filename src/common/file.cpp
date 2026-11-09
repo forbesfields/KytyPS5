@@ -197,17 +197,17 @@ uint64_t File::Tell() const {
 	return SysFileTell(*m_p->f);
 }
 
-void File::Read(void* data, uint32_t size, uint32_t* bytes_read) {
+bool File::Read(void* data, uint32_t size, uint32_t* bytes_read) {
 	EXIT_IF(IsInvalid());
 
 	if (m_p->archive != nullptr) {
-		m_p->archive->Read(data, size, bytes_read);
-		return;
+		return m_p->archive->Read(data, size, bytes_read);
 	}
 
 	if (m_p->f != nullptr) {
 		SysFileRead(data, size, *m_p->f, bytes_read);
 	}
+	return true;
 }
 
 void File::Write(const void* data, uint32_t size, uint32_t* bytes_written) {

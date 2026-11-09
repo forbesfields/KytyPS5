@@ -24,7 +24,7 @@ QString LauncherRelativePath() {
 #if defined(_WIN32)
 	return QStringLiteral("kyty_launcher.exe");
 #elif defined(__APPLE__)
-	return QStringLiteral("KytyPS5.app/Contents/MacOS/KytyPS5");
+	return QStringLiteral("PuppyPS5.app/Contents/MacOS/PuppyPS5");
 #else
 	return QStringLiteral("kyty_launcher");
 #endif
@@ -34,7 +34,7 @@ QString InstallDirectory() {
 	QDir dir(QCoreApplication::applicationDirPath());
 #if defined(__APPLE__)
 	// Official macOS releases are a bundle; never update a flat development build.
-	if (!dir.cdUp() || !dir.cdUp() || dir.dirName() != QStringLiteral("KytyPS5.app") ||
+	if (!dir.cdUp() || !dir.cdUp() || dir.dirName() != QStringLiteral("PuppyPS5.app") ||
 	    !dir.cdUp()) {
 		return {};
 	}

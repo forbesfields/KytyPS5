@@ -190,6 +190,21 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 config_compiler_and_linker()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
+# Use the platform zlib when available. Windows builds can use the pinned static fallback.
+find_package(ZLIB QUIET)
+if(NOT ZLIB_FOUND)
+	include(FetchContent)
+	set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+	FetchContent_Declare(zlib
+		GIT_REPOSITORY https://github.com/madler/zlib.git
+		GIT_TAG 51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf # v1.3.1
+		GIT_SHALLOW FALSE)
+	FetchContent_MakeAvailable(zlib)
+	set_property(DIRECTORY "${zlib_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL TRUE)
+	add_library(ZLIB::ZLIB ALIAS zlibstatic)
+	install(FILES "${zlib_SOURCE_DIR}/zlib.h" DESTINATION "licenses/zlib")
+endif()
+install(FILES "${PROJECT_SOURCE_DIR}/LICENSES/KytyPlus-GameImage-MIT.txt" DESTINATION "licenses/image-reader")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
@@ -414,6 +429,10 @@ add_executable(archive_file_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(archive_file_tests common ZArchive::zarchive)
 target_include_directories(archive_file_tests PRIVATE ${inc_headers})
+
+add_executable(image_archive_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ImageArchiveTests.cpp")
+target_link_libraries(image_archive_tests common ZLIB::ZLIB)
+target_include_directories(image_archive_tests PRIVATE ${inc_headers})
 
 add_executable(trophy_system_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/TrophySystemTests.cpp"
@@ -684,6 +703,7 @@ if(BUILD_TESTING)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
+	add_test(NAME image_archive COMMAND $<TARGET_FILE:image_archive_tests>)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
@@ -695,6 +715,15 @@ if(BUILD_TESTING)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
+	set(corrupt_image_fixture "${CMAKE_CURRENT_BINARY_DIR}/corrupt-asset-test.ffpfsc")
+	add_test(NAME image_archive_corrupt_fixture COMMAND $<TARGET_FILE:image_archive_tests>
+		--write-corrupt "${corrupt_image_fixture}")
+	add_test(NAME kernel_archive_file COMMAND $<TARGET_FILE:kernel_file_system_tests>
+		--archive-only "${corrupt_image_fixture}")
+	add_test(NAME image_archive_cleanup COMMAND ${CMAKE_COMMAND} -E rm -f "${corrupt_image_fixture}")
+	set_tests_properties(image_archive_corrupt_fixture PROPERTIES FIXTURES_SETUP corrupt_image)
+	set_tests_properties(kernel_archive_file PROPERTIES FIXTURES_REQUIRED corrupt_image)
+	set_tests_properties(image_archive_cleanup PROPERTIES FIXTURES_CLEANUP corrupt_image)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
@@ -801,6 +830,7 @@ if(BUILD_TESTING)
 		page_manager_tests
 		build_flags_tests
 		archive_file_tests
+		image_archive_tests
 		trophy_system_tests
 		avplayer_file_tests
 		vdecsw_tests

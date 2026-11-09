@@ -1,4 +1,5 @@
 #include "common/archive.h"
+#include "common/archiveReader.h"
 
 #include "common/stringUtils.h"
 
@@ -21,22 +22,6 @@
 #endif
 
 namespace Common {
-
-// Backends expose immutable metadata and offset-based reads. Cursor management, path routing,
-// reader lifetime and the host-stack worker are shared by every archive format.
-class ArchiveReader {
-public:
-	struct Entry {
-		uint64_t id;
-		uint64_t size;
-		bool     is_file;
-	};
-
-	virtual ~ArchiveReader()                                                       = default;
-	virtual std::optional<Entry>        Find(std::string_view member)              = 0;
-	virtual std::vector<File::DirEntry> List(std::string_view member)              = 0;
-	virtual uint64_t Read(uint64_t id, uint64_t offset, uint32_t size, void* data) = 0;
-};
 
 namespace {
 
@@ -92,7 +77,7 @@ struct ArchiveFormat {
 	std::shared_ptr<ArchiveReader> (*open)(const std::filesystem::path&);
 };
 
-constexpr ArchiveFormat Formats[] = {{".zar", OpenZArchive}};
+constexpr ArchiveFormat Formats[] = {{".zar", OpenZArchive}, {".ffpfsc", OpenImageArchive}};
 using NativeView                  = std::basic_string_view<std::filesystem::path::value_type>;
 
 const ArchiveFormat* FindFormat(NativeView path) {
@@ -262,7 +247,7 @@ bool ArchiveFile::Seek(uint64_t offset) {
 	return true;
 }
 
-void ArchiveFile::Read(void* data, uint32_t size, uint32_t* bytes_read) {
+bool ArchiveFile::Read(void* data, uint32_t size, uint32_t* bytes_read) {
 #if defined(KYTY_ARCHIVE_PTHREAD_CANCELLATION)
 	// A pending cancellation must not destroy the waiting request or its TLS buffer while the
 	// worker still uses them. Restore the caller's state only after the copy is complete.
@@ -272,6 +257,7 @@ void ArchiveFile::Read(void* data, uint32_t size, uint32_t* bytes_read) {
 	constexpr uint32_t                chunk_size = 1u << 20u;
 	thread_local std::vector<uint8_t> chunk;
 	uint32_t                          read = 0;
+	bool                              success = true;
 	if (data != nullptr && size != 0 && m_p->position < Size()) {
 		const auto requested =
 		    static_cast<uint32_t>(std::min<uint64_t>(size, Size() - m_p->position));
@@ -283,12 +269,14 @@ void ArchiveFile::Read(void* data, uint32_t size, uint32_t* bytes_read) {
 			const auto got  = ArchiveIoThread::Instance().Read(*m_p->reader, m_p->entry.id,
 			                                                   m_p->position, step, chunk.data());
 			if (got == 0 || got > step) {
+				success = false;
 				break;
 			}
 			std::memcpy(static_cast<uint8_t*>(data) + read, chunk.data(), got);
 			read += static_cast<uint32_t>(got);
 			m_p->position += got;
 			if (got < step) {
+				success = false;
 				break;
 			}
 		}
@@ -299,6 +287,7 @@ void ArchiveFile::Read(void* data, uint32_t size, uint32_t* bytes_read) {
 #if defined(KYTY_ARCHIVE_PTHREAD_CANCELLATION)
 	pthread_setcancelstate(cancellation_state, nullptr);
 #endif
+	return success;
 }
 
 std::filesystem::path MakeArchivePath(const std::filesystem::path& archive,

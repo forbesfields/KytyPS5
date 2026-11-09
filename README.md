@@ -1,4 +1,9 @@
-# KytyPS5
+# PuppyPS5
+
+PuppyPS5 is this fork's app name. It includes the macOS compatibility changes and direct FFPFSC
+reading. The Mac app keeps the existing `~/Library/Application Support/KytyPS5` data folder and
+`Kyty/Kyty.ini` settings, so the rename keeps existing saves and preferences available. The upstream
+project and source identifiers below retain the KytyPS5 name.
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Linux%29&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
@@ -327,7 +332,7 @@ cmake --install _Build/macos --prefix _Build/macos/install
 
 The build re-signs `kyty_emulator` with the JIT entitlements it needs to execute translated
 guest code; no manual signing step is required. When the launcher is built, the installation
-also produces `_Build/macos/install/KytyPS5.app` — double-click to launch the GUI.
+also produces `_Build/macos/install/PuppyPS5.app` — double-click to launch the GUI.
 A flat `kyty_emulator` is kept for CLI usage.
 
 The macOS launcher keeps save data, caches and settings in
@@ -337,13 +342,13 @@ older portable installation, copy its `_SaveData` directory there before launchi
 Vulkan comes from MoltenVK. Download `MoltenVK-macos.tar` from the
 [MoltenVK releases](https://github.com/KhronosGroup/MoltenVK/releases), then copy
 `MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to the flat `kyty_emulator`
-(and, for the bundle, into `KytyPS5.app/Contents/Frameworks/`) and sign it with an ad hoc signature:
+(and, for the bundle, into `PuppyPS5.app/Contents/Frameworks/`) and sign it with an ad hoc signature:
 
 ```bash
 codesign --force --sign - _Build/macos/install/libMoltenVK.dylib
 # For the bundle (if present):
-codesign --force --sign - _Build/macos/install/KytyPS5.app/Contents/Frameworks/libMoltenVK.dylib
-codesign --force --sign - _Build/macos/install/KytyPS5.app
+codesign --force --sign - _Build/macos/install/PuppyPS5.app/Contents/Frameworks/libMoltenVK.dylib
+codesign --force --sign - _Build/macos/install/PuppyPS5.app
 ```
 
 Release archives already include a signed `libMoltenVK.dylib` (both flat and inside the bundle).
@@ -391,13 +396,26 @@ To use the graphical launcher:
 ```
 
 ```bash
-open _Build/macos/install/KytyPS5.app  # or double-click in Finder
+open _Build/macos/install/PuppyPS5.app  # or double-click in Finder
 ```
 
 On first launch, add one or more game folders in the global settings. The launcher searches those
-folders recursively for game directories containing `eboot.bin` and ZArchive (`.zar`) game dumps
-whose archive root contains `eboot.bin`. Select a detected game and run it from the game list.
-ZArchive dumps are mounted read-only and streamed directly; they do not need to be extracted first.
+folders recursively for game directories containing `eboot.bin`, ZArchive (`.zar`) dumps, and
+plaintext FFPFSC (`.ffpfsc`) images whose root contains `eboot.bin`. Select a detected game and run
+it from the game list. Archives are mounted read-only and streamed directly without extraction.
+
+FFPFSC support reads PFS wrappers, independent zlib/raw PFSC blocks, and exFAT file data. Encrypted
+images and other package compression formats are not supported. CMake uses the platform zlib or
+fetches a pinned static fallback. The image reader needs no .NET runtime.
+
+To compare an image with its original folder, build `image_archive_tests` and run:
+
+```bash
+./_Build/macos/image_archive_tests "/games/ExampleGame.ffpfsc" "/games/ExampleGame"
+```
+
+This checks every original file byte and eight random reads per nonempty file. It does not prove
+that the emulator can play that title. Keep the original until gameplay and saves are checked.
 
 Official release builds include a built-in updater. Leave **Check for updates on startup** enabled,
 or click **Check for updates**, then choose **Install Update**. The launcher downloads the package
@@ -407,8 +425,8 @@ preserved; replacement failures restore the previous files. The installation fol
 If a package cannot be installed automatically, the updater offers the GitHub release page.
 Source builds and builds from forks do not replace themselves with official releases.
 
-The emulator can also be started directly with a legally obtained game directory, ELF file, or
-ZArchive dump:
+The emulator can also be started directly with a legally obtained game directory, ELF file,
+ZArchive dump, or FFPFSC image:
 
 ```powershell
 .\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
@@ -418,6 +436,7 @@ ZArchive dump:
 ```bash
 ./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
 ./_Build/linux/install/kyty_emulator --game "/games/ExampleGame.zar"
+./_Build/linux/install/kyty_emulator --game "/games/ExampleGame.ffpfsc"
 ```
 
 On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically; no

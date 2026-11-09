@@ -2826,9 +2826,12 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  TestMutexHandoff();
-  TestStaticRwlockDestroy();
-  TestPendingSignalDispatch();
+  const bool archive_only = argc >= 2 && std::string_view(argv[1]) == "--archive-only";
+  if (!archive_only) {
+    TestMutexHandoff();
+    TestStaticRwlockDestroy();
+    TestPendingSignalDispatch();
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: mutex cases passed\n");
@@ -2847,6 +2850,31 @@ int main(int argc, char** argv) {
   TempDirectory temporary;
   CheckOpenFileCoherence(temporary.Path());
   FileSystem::Initialize();
+  if (archive_only) {
+    CheckArchiveMount(temporary.Path());
+    if (argc == 3) {
+      FileSystem::Mount(Common::MakeArchivePath(argv[2]), "/corrupt");
+      const int fd = FileSystem::KernelOpen("/corrupt/eboot.bin", 0, 0);
+      Check(fd >= 3, "open corrupt image with valid metadata");
+      std::array<uint8_t, 16> data{};
+      Check(FileSystem::KernelRead(fd, data.data(), data.size()) == Libs::LibKernel::KERNEL_ERROR_EIO,
+            "corrupt image read returns EIO");
+      Check(FileSystem::KernelPread(fd, data.data(), data.size(), 0) == Libs::LibKernel::KERNEL_ERROR_EIO,
+            "corrupt image pread returns EIO");
+      FileSystem::KernelIovec iov{data.data(), data.size()};
+      Check(FileSystem::KernelPreadv(fd, &iov, 1, 0) == Libs::LibKernel::KERNEL_ERROR_EIO,
+            "corrupt image preadv returns EIO");
+      Check(FileSystem::KernelLseek(fd, 0, 2) > 0 &&
+                FileSystem::KernelRead(fd, data.data(), data.size()) == 0,
+            "ordinary EOF still returns zero");
+      Check(FileSystem::KernelClose(fd) == OK, "close corrupt image descriptor");
+    }
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: archive cases passed\n");
+    return 0;
+  }
   TestSysmoduleReferences();
   TestSystemServiceEntitlementEvents();
   TestAddContent(temporary.Path());

@@ -20,7 +20,7 @@ public:
 	[[nodiscard]] uint64_t Size() const;
 	[[nodiscard]] uint64_t Tell() const;
 	bool                   Seek(uint64_t offset);
-	void                   Read(void* data, uint32_t size, uint32_t* bytes_read);
+	bool                   Read(void* data, uint32_t size, uint32_t* bytes_read);
 
 	KYTY_CLASS_NO_COPY(ArchiveFile);
 
