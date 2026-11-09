@@ -1,4 +1,9 @@
-# KytyPS5
+# PuppyPS5
+
+PuppyPS5 is this fork's app name. It includes the macOS compatibility changes and direct FFPFSC
+reading. The Mac app keeps the existing `~/Library/Application Support/KytyPS5` data folder and
+`Kyty/Kyty.ini` settings, so the rename keeps existing saves and preferences available. The upstream
+project and source identifiers below retain the KytyPS5 name.
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Linux%29&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
@@ -327,7 +332,7 @@ cmake --install _Build/macos --prefix _Build/macos/install
 
 The build re-signs `kyty_emulator` with the JIT entitlements it needs to execute translated
 guest code; no manual signing step is required. When the launcher is built, the installation
-also produces `_Build/macos/install/KytyPS5.app` — double-click to launch the GUI.
+also produces `_Build/macos/install/PuppyPS5.app` — double-click to launch the GUI.
 A flat `kyty_emulator` is kept for CLI usage.
 
 The macOS launcher keeps save data, caches and settings in
@@ -337,13 +342,13 @@ older portable installation, copy its `_SaveData` directory there before launchi
 Vulkan comes from MoltenVK. Download `MoltenVK-macos.tar` from the
 [MoltenVK releases](https://github.com/KhronosGroup/MoltenVK/releases), then copy
 `MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to the flat `kyty_emulator`
-(and, for the bundle, into `KytyPS5.app/Contents/Frameworks/`) and sign it with an ad hoc signature:
+(and, for the bundle, into `PuppyPS5.app/Contents/Frameworks/`) and sign it with an ad hoc signature:
 
 ```bash
 codesign --force --sign - _Build/macos/install/libMoltenVK.dylib
 # For the bundle (if present):
-codesign --force --sign - _Build/macos/install/KytyPS5.app/Contents/Frameworks/libMoltenVK.dylib
-codesign --force --sign - _Build/macos/install/KytyPS5.app
+codesign --force --sign - _Build/macos/install/PuppyPS5.app/Contents/Frameworks/libMoltenVK.dylib
+codesign --force --sign - _Build/macos/install/PuppyPS5.app
 ```
 
 Release archives already include a signed `libMoltenVK.dylib` (both flat and inside the bundle).
@@ -391,7 +396,7 @@ To use the graphical launcher:
 ```
 
 ```bash
-open _Build/macos/install/KytyPS5.app  # or double-click in Finder
+open _Build/macos/install/PuppyPS5.app  # or double-click in Finder
 ```
 
 On first launch, add one or more game folders in the global settings. The launcher searches those

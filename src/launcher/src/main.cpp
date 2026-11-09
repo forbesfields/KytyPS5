@@ -10,12 +10,14 @@
 
 int main(int argc, char* argv[]) {
 	QApplication a(argc, argv);
+	a.setApplicationDisplayName(QStringLiteral("PuppyPS5"));
 #if defined(__APPLE__)
-	// Keep writable state outside the signed app, including when macOS translocates it.
+	// Keep the existing KytyPS5 data path so PuppyPS5 uses the same saves and settings.
+	// Writable state stays outside the signed app, including when macOS translocates it.
 	const auto runtime = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation))
 	                         .filePath(QStringLiteral("KytyPS5"));
 	if (!QDir().mkpath(runtime) || !QDir::setCurrent(runtime)) {
-		QMessageBox::critical(nullptr, QStringLiteral("KytyPS5"),
+		QMessageBox::critical(nullptr, QStringLiteral("PuppyPS5"),
 		                      QStringLiteral("Cannot open the application data folder:\n%1").arg(runtime));
 		return 1;
 	}
