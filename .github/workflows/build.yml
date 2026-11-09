@@ -231,7 +231,7 @@ jobs:
           archive="$RUNNER_TEMP/MoltenVK-macos.tar"
           package="$RUNNER_TEMP/MoltenVK"
           install_dir="_Build/macos/install"
-          app_dir="$install_dir/KytyPS5.app"
+          app_dir="$install_dir/PuppyPS5.app"
           moltenvk="$install_dir/libMoltenVK.dylib"
           curl --fail --location --retry 3 \
             --output "$archive" \
@@ -253,12 +253,12 @@ jobs:
         shell: bash
         run: |
           install_dir="_Build/macos/install"
-          app_dir="$install_dir/KytyPS5.app"
+          app_dir="$install_dir/PuppyPS5.app"
           test -d "$app_dir"
           for binary in \
             "$install_dir/kyty_emulator" \
             "$install_dir/libMoltenVK.dylib" \
-            "$app_dir/Contents/MacOS/KytyPS5" \
+            "$app_dir/Contents/MacOS/PuppyPS5" \
             "$app_dir/Contents/MacOS/kyty_emulator" \
             "$app_dir/Contents/MacOS/kyty_updater" \
             "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
@@ -268,7 +268,7 @@ jobs:
           for binary in \
             "$install_dir/kyty_emulator" \
             "$install_dir/libMoltenVK.dylib" \
-            "$app_dir/Contents/MacOS/KytyPS5" \
+            "$app_dir/Contents/MacOS/PuppyPS5" \
             "$app_dir/Contents/MacOS/kyty_emulator" \
             "$app_dir/Contents/MacOS/kyty_updater" \
             "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
