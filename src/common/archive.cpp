@@ -1,4 +1,5 @@
 #include "common/archive.h"
+#include "common/archiveReader.h"
 
 #include "common/stringUtils.h"
 
@@ -21,22 +22,6 @@
 #endif
 
 namespace Common {
-
-// Backends expose immutable metadata and offset-based reads. Cursor management, path routing,
-// reader lifetime and the host-stack worker are shared by every archive format.
-class ArchiveReader {
-public:
-	struct Entry {
-		uint64_t id;
-		uint64_t size;
-		bool     is_file;
-	};
-
-	virtual ~ArchiveReader()                                                       = default;
-	virtual std::optional<Entry>        Find(std::string_view member)              = 0;
-	virtual std::vector<File::DirEntry> List(std::string_view member)              = 0;
-	virtual uint64_t Read(uint64_t id, uint64_t offset, uint32_t size, void* data) = 0;
-};
 
 namespace {
 
@@ -92,7 +77,7 @@ struct ArchiveFormat {
 	std::shared_ptr<ArchiveReader> (*open)(const std::filesystem::path&);
 };
 
-constexpr ArchiveFormat Formats[] = {{".zar", OpenZArchive}};
+constexpr ArchiveFormat Formats[] = {{".zar", OpenZArchive}, {".ffpfsc", OpenImageArchive}};
 using NativeView                  = std::basic_string_view<std::filesystem::path::value_type>;
 
 const ArchiveFormat* FindFormat(NativeView path) {

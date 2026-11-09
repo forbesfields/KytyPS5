@@ -395,9 +395,22 @@ open _Build/macos/install/KytyPS5.app  # or double-click in Finder
 ```
 
 On first launch, add one or more game folders in the global settings. The launcher searches those
-folders recursively for game directories containing `eboot.bin` and ZArchive (`.zar`) game dumps
-whose archive root contains `eboot.bin`. Select a detected game and run it from the game list.
-ZArchive dumps are mounted read-only and streamed directly; they do not need to be extracted first.
+folders recursively for game directories containing `eboot.bin`, ZArchive (`.zar`) dumps, and
+plaintext FFPFSC (`.ffpfsc`) images whose root contains `eboot.bin`. Select a detected game and run
+it from the game list. Archives are mounted read-only and streamed directly without extraction.
+
+FFPFSC support reads PFS wrappers, independent zlib/raw PFSC blocks, and exFAT file data. Encrypted
+images and other package compression formats are not supported. CMake uses the platform zlib or
+fetches a pinned static fallback. The image reader needs no .NET runtime.
+
+To compare an image with its original folder, build `image_archive_tests` and run:
+
+```bash
+./_Build/macos/image_archive_tests "/games/ExampleGame.ffpfsc" "/games/ExampleGame"
+```
+
+This checks every original file byte and eight random reads per nonempty file. It does not prove
+that the emulator can play that title. Keep the original until gameplay and saves are checked.
 
 Official release builds include a built-in updater. Leave **Check for updates on startup** enabled,
 or click **Check for updates**, then choose **Install Update**. The launcher downloads the package
@@ -407,8 +420,8 @@ preserved; replacement failures restore the previous files. The installation fol
 If a package cannot be installed automatically, the updater offers the GitHub release page.
 Source builds and builds from forks do not replace themselves with official releases.
 
-The emulator can also be started directly with a legally obtained game directory, ELF file, or
-ZArchive dump:
+The emulator can also be started directly with a legally obtained game directory, ELF file,
+ZArchive dump, or FFPFSC image:
 
 ```powershell
 .\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
@@ -418,6 +431,7 @@ ZArchive dump:
 ```bash
 ./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
 ./_Build/linux/install/kyty_emulator --game "/games/ExampleGame.zar"
+./_Build/linux/install/kyty_emulator --game "/games/ExampleGame.ffpfsc"
 ```
 
 On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically; no

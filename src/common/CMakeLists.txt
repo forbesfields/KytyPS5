@@ -11,6 +11,7 @@ if(KYTY_CLANG_CL)
 endif()
 
 add_library(common STATIC ${common_src} ${common_headers})
+target_link_libraries(common PRIVATE ZLIB::ZLIB)
 
 set(localization_dir "${PROJECT_SOURCE_DIR}/assets/localization")
 file(GLOB localization_catalogs CONFIGURE_DEPENDS "${localization_dir}/*.json")

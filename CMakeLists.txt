@@ -190,6 +190,21 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 config_compiler_and_linker()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
+# Use the platform zlib when available. Windows builds can use the pinned static fallback.
+find_package(ZLIB QUIET)
+if(NOT ZLIB_FOUND)
+	include(FetchContent)
+	set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+	FetchContent_Declare(zlib
+		GIT_REPOSITORY https://github.com/madler/zlib.git
+		GIT_TAG 51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf # v1.3.1
+		GIT_SHALLOW FALSE)
+	FetchContent_MakeAvailable(zlib)
+	set_property(DIRECTORY "${zlib_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL TRUE)
+	add_library(ZLIB::ZLIB ALIAS zlibstatic)
+	install(FILES "${zlib_SOURCE_DIR}/zlib.h" DESTINATION "licenses/zlib")
+endif()
+install(FILES "${PROJECT_SOURCE_DIR}/LICENSES/KytyPlus-GameImage-MIT.txt" DESTINATION "licenses/image-reader")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
@@ -414,6 +429,10 @@ add_executable(archive_file_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(archive_file_tests common ZArchive::zarchive)
 target_include_directories(archive_file_tests PRIVATE ${inc_headers})
+
+add_executable(image_archive_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ImageArchiveTests.cpp")
+target_link_libraries(image_archive_tests common ZLIB::ZLIB)
+target_include_directories(image_archive_tests PRIVATE ${inc_headers})
 
 add_executable(trophy_system_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/TrophySystemTests.cpp"
@@ -684,6 +703,7 @@ if(BUILD_TESTING)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
+	add_test(NAME image_archive COMMAND $<TARGET_FILE:image_archive_tests>)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
@@ -801,6 +821,7 @@ if(BUILD_TESTING)
 		page_manager_tests
 		build_flags_tests
 		archive_file_tests
+		image_archive_tests
 		trophy_system_tests
 		avplayer_file_tests
 		vdecsw_tests
