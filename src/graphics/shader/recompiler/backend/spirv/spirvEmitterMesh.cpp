@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/meshEmulation.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -46,7 +47,7 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
 		const bool cull = output.kind == IR::StageOutputKind::CullDistance;
 		auto& variable = clip ? state.clip_distance_variable
 		                 : cull ? state.cull_distance_variable : output.variable_id;
-		if (variable == 0) {
+		if (!state.MeshEmulated() && variable == 0) {
 			const auto element_type = clip || cull
 			                              ? state.builder.Type(spv::OpTypeArray, type,
 			                                                   ConstantU32(state, clip ? clip_distance_count
@@ -81,6 +82,7 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
 	state.mesh_allocation = MeshArray(state, spv::StorageClassWorkgroup, TypeU32(state), 2);
 	state.mesh_primitive_data =
 	    MeshArray(state, spv::StorageClassPrivate, TypeU32(state), state.lane_count);
+	if (state.MeshEmulated()) return;
 	state.mesh_primitives =
 	    MeshArray(state, spv::StorageClassOutput, TypeU32Vector(state, 3), mesh.max_primitives);
 	state.mesh_cull =
@@ -135,6 +137,91 @@ void EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
+uint32_t EmitMeshEmulationHeaderLoad(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain,
+	    TypePointer(state, spv::StorageClassStorageBuffer, TypeU32(state)), pointer,
+	    state.mesh_output_buffer, ConstantU32(state, 0u), ConstantU32(state, index));
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
+}
+
+static void EmitEmulatedMeshOutputs(EmitterState& state, uint32_t vertices, uint32_t primitives) {
+	const auto layout = BuildMeshEmulationLayout(state.program.info.outputs, *state.input_info.vertex);
+	const auto Bound = [&](uint32_t count, uint32_t limit) {
+		const auto fits = state.builder.AllocateId();
+		const auto bounded = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), fits, count, ConstantU32(state, limit));
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), bounded, fits, count, ConstantU32(state, limit));
+		return bounded;
+	};
+	vertices = Bound(vertices, layout.max_vertices);
+	primitives = Bound(primitives, layout.max_primitives);
+	const auto group = EmitAddU32(state,
+	    EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0u),
+	    EmitBinaryU32(state, spv::OpIMul,
+	        EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1u),
+	        EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0u)));
+	const auto base = EmitAddU32(state, ConstantU32(state, MeshEmulationLayout::HeaderDwords),
+	    EmitBinaryU32(state, spv::OpIMul, group, ConstantU32(state, layout.GroupDwords())));
+	const auto Store = [&](uint32_t offset, uint32_t value) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		    TypePointer(state, spv::StorageClassStorageBuffer, TypeU32(state)), pointer,
+		    state.mesh_output_buffer, ConstantU32(state, 0u), offset);
+		state.builder.AddFunction(spv::OpStore, pointer, value);
+	};
+	for (uint32_t half = 0; half < state.lane_count; ++half) {
+		state.lane_half = half;
+		const auto index = EmitLocalInvocationIndex(state);
+		const auto first = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), first, index, ConstantU32(state, 0u));
+		EmitIfCondition(state, first, [&] {
+			Store(base, vertices);
+			Store(EmitAddU32(state, base, ConstantU32(state, 1u)), primitives);
+		});
+		const auto is_vertex = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), is_vertex, index, vertices);
+		EmitIfCondition(state, is_vertex, [&] {
+			const auto vertex_base = EmitAddU32(state, base,
+			    EmitAddU32(state, ConstantU32(state, layout.VerticesOffset()),
+			        EmitBinaryU32(state, spv::OpIMul, index, ConstantU32(state, layout.vertex_dwords))));
+			EXIT_IF(layout.fields.size() != state.outputs.size());
+			for (uint32_t f = 0; f < state.outputs.size(); ++f) {
+				const auto& output = state.outputs[f];
+				const bool shared = output.kind == IR::StageOutputKind::Layer;
+				const bool vector = output.kind == IR::StageOutputKind::Position ||
+				                    output.kind == IR::StageOutputKind::Parameter;
+				auto value = MeshLoad(state, output.mesh_data_variable,
+				    shared ? spv::StorageClassWorkgroup : spv::StorageClassPrivate,
+				    MeshOutputType(state, output.kind), shared ? index : ConstantU32(state, half));
+				if (!shared) {
+					const auto bits = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpBitcast, vector ? TypeU32Vector(state, 4u) : TypeU32(state), bits, value);
+					value = bits;
+				}
+				for (uint32_t c = 0; c < (vector ? 4u : 1u); ++c) {
+					auto component = value;
+					if (vector) {
+						component = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), component, value, c);
+					}
+					Store(EmitAddU32(state, vertex_base, ConstantU32(state, layout.fields[f].offset + c)), component);
+				}
+			}
+		});
+		const auto is_primitive = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), is_primitive, index, primitives);
+		EmitIfCondition(state, is_primitive, [&] {
+			Store(EmitAddU32(state, base, EmitAddU32(state, ConstantU32(state, 2u), index)),
+			    MeshLoad(state, state.mesh_primitive_data, spv::StorageClassPrivate,
+			             TypeU32(state), ConstantU32(state, half)));
+		});
+	}
+	state.lane_half = 0u;
+}
+
 void EmitMeshEntryPoint(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state), state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
@@ -147,6 +234,12 @@ void EmitMeshEntryPoint(EmitterState& state) {
 	                                 TypeU32(state), ConstantU32(state, 0));
 	const auto primitives = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
 	                                 TypeU32(state), ConstantU32(state, 1));
+	if (state.MeshEmulated()) {
+		EmitEmulatedMeshOutputs(state, vertices, primitives);
+		state.builder.AddFunction(spv::OpReturn);
+		state.builder.AddFunction(spv::OpFunctionEnd);
+		return;
+	}
 	state.builder.AddFunction(spv::OpSetMeshOutputsEXT, vertices,
 	                          primitives); // OpSetMeshOutputsEXT
 	for (uint32_t half = 0; half < state.lane_count; half++) {

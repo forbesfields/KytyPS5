@@ -1,4 +1,6 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/meshEmulation.h"
+#include "graphics/shader/triangleShader.h"
 
 #include <algorithm>
 #include <bit>
@@ -241,6 +243,17 @@ void DefineDescriptors(EmitterState& state) {
 	auto& buffer_count = counts[static_cast<size_t>(Kind::Buffers)];
 	for (auto& buffer: info.buffers) {
 		buffer.descriptor_index = buffer.live ? buffer_count++ : UINT32_MAX;
+	}
+	if (state.MeshEmulated()) {
+		state.mesh_output_buffer = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassStorageBuffer,
+		                StorageBufferType(state, state.storage_buffers[2])),
+		    spv::StorageClassStorageBuffer);
+		state.builder.AddAnnotation(spv::OpDecorate, state.mesh_output_buffer,
+		                            spv::DecorationDescriptorSet, 0u);
+		state.builder.AddAnnotation(spv::OpDecorate, state.mesh_output_buffer,
+		                            spv::DecorationBinding, MeshEmulationBinding);
+		state.builder.AddName(state.mesh_output_buffer, "mesh_output");
 	}
 	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
 	for (auto& image: info.images) {
@@ -495,6 +508,14 @@ void DefineInputs(EmitterState& state) {
 		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
 	}
+	if (state.program.stage == ShaderType::Mesh) {
+		// The output wrapper uses the invocation index even if the guest body does not.
+		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
+	}
+	if (state.MeshEmulated()) {
+		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
+		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
+	}
 	if (state.lane_count == 2) {
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
@@ -568,7 +589,8 @@ void DefineInputs(EmitterState& state) {
 			const auto flat = PixelParameterIsFlat(state, input.location);
 			if (input.per_vertex) {
 				state.builder.AddAnnotation(spv::OpDecorate, input.variable_id,
-				                            spv::DecorationPerVertexKHR);
+				                            state.input_info.pixel->emulate_per_vertex
+				                                ? spv::DecorationFlat : spv::DecorationPerVertexKHR);
 			} else if (flat) {
 				state.builder.AddAnnotation(spv::OpDecorate, input.variable_id,
 				                            spv::DecorationFlat);
@@ -580,6 +602,17 @@ void DefineInputs(EmitterState& state) {
 			}
 			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationLocation,
 			                            PixelParameterLocation(state, input.location));
+		} else if (state.program.stage == ShaderType::Pixel &&
+		           state.input_info.pixel->emulate_per_vertex &&
+		           (input.kind == IR::StageInputKind::BaryCoordSmooth ||
+		            input.kind == IR::StageInputKind::BaryCoordNoPerspective)) {
+			const auto parameters = TriangleParameters(*state.input_info.pixel, state.program.info);
+			const auto parameter = std::ranges::find(parameters, input.kind, &TriangleParameter::source);
+			EXIT_IF(parameter == parameters.end());
+			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationLocation,
+			                            parameter->output_location);
+			if (parameter->no_perspective)
+				state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationNoPerspective);
 		} else if (const auto builtin = BuiltInForInput(input.kind); builtin != UINT32_MAX) {
 			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationBuiltIn,
 			                            builtin);
@@ -753,20 +786,22 @@ void DefineModule(EmitterState& state) {
 	state.main_func = state.builder.AllocateId();
 	if (state.program.stage == ShaderType::Mesh) {
 		state.mesh_guest_func = state.builder.AllocateId();
-		state.builder.RequireCapability(spv::CapabilityMeshShadingEXT); // MeshShadingEXT
-		state.builder.RequireExtension("SPV_EXT_mesh_shader");
-		state.builder.AddExecutionMode(state.main_func,
-		                               spv::ExecutionModeOutputTrianglesEXT); // OutputTrianglesEXT
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
-		                               state.input_info.vertex->mesh.max_vertices);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,
-		                               state.input_info.vertex->mesh.max_primitives);
-		if (state.input_info.vertex->indirect_draw) {
-			// The task shader's payload (gpu_mesh_indirect.task).
-			const auto count   = ConstantU32(state, IR::PushData::MeshTaskPayloadDwordCount);
-			state.mesh_payload = DefineInterfaceVariable(
-			    state, state.builder.Type(spv::OpTypeArray, TypeU32(state), count),
-			    spv::StorageClassTaskPayloadWorkgroupEXT, "payload");
+		if (!state.MeshEmulated()) {
+			state.builder.RequireCapability(spv::CapabilityMeshShadingEXT); // MeshShadingEXT
+			state.builder.RequireExtension("SPV_EXT_mesh_shader");
+			state.builder.AddExecutionMode(state.main_func,
+			                               spv::ExecutionModeOutputTrianglesEXT); // OutputTrianglesEXT
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
+			                               state.input_info.vertex->mesh.max_vertices);
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,
+			                               state.input_info.vertex->mesh.max_primitives);
+			if (state.input_info.vertex->indirect_draw) {
+				// The task shader's payload (gpu_mesh_indirect.task).
+				const auto count = ConstantU32(state, IR::PushData::MeshTaskPayloadDwordCount);
+				state.mesh_payload = DefineInterfaceVariable(
+				    state, state.builder.Type(spv::OpTypeArray, TypeU32(state), count),
+				    spv::StorageClassTaskPayloadWorkgroupEXT, "payload");
+			}
 		}
 	}
 	if (state.program.stage == ShaderType::TessellationControl ||
@@ -847,9 +882,10 @@ void DefineModule(EmitterState& state) {
 	}
 	const bool fragment_barycentric =
 	    state.program.stage == ShaderType::Pixel &&
-	    std::any_of(state.inputs.begin(), state.inputs.end(), [](const InputBinding& input) {
-		    return input.per_vertex || input.kind == IR::StageInputKind::BaryCoordSmooth ||
-		           input.kind == IR::StageInputKind::BaryCoordNoPerspective;
+	    std::any_of(state.inputs.begin(), state.inputs.end(), [&](const InputBinding& input) {
+		    return !state.input_info.pixel->emulate_per_vertex &&
+		           (input.per_vertex || input.kind == IR::StageInputKind::BaryCoordSmooth ||
+		            input.kind == IR::StageInputKind::BaryCoordNoPerspective);
 	    });
 	if (fragment_barycentric) {
 		state.builder.RequireCapability(spv::CapabilityFragmentBarycentricKHR);

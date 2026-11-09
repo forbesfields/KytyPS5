@@ -746,6 +746,16 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --null-image-specialization-only)
 	add_test(NAME shader_null_image_shape
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --null-image-specialization-only)
+	add_test(NAME shader_texture_mip_views
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --texture-mip-view-only)
+	add_test(NAME shader_mesh_emulation
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --mesh-emulation-only)
+	add_test(NAME shader_portable_interpolation
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --portable-interpolation-only)
+	if(APPLE)
+		add_test(NAME shader_vertex_launch
+			COMMAND $<TARGET_FILE:shader_cfg_tests> --vertex-launch-only)
+	endif()
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_float_min_max

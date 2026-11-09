@@ -45,6 +45,7 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
+	vk::DescriptorBufferInfo              mesh_output;
 	std::vector<uint32_t>                 shader_data;
 };
 
@@ -62,6 +63,10 @@ template <typename T>
 	std::memcpy(&result, value.dwords.data(), sizeof(result));
 	return result;
 }
+
+// Resolve a view beyond MAX_MIP only when it addresses the same guest layout.
+[[nodiscard]] bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, bool metadata,
+                                         uint32_t view_levels, uint32_t& base_level);
 
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor,
                                                    bool r128 = false);

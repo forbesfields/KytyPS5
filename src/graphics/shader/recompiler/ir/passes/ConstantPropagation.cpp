@@ -831,6 +831,51 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 	}
 }
 
+// Conservative unsigned bounds remove launch predicates without assuming a particular
+// lane. Limit recursion so cyclic SSA values and long expressions remain unknown.
+uint32_t UnsignedUpperBound(Value value, uint32_t wave_size, uint32_t depth = 0u) {
+	value = value.Resolve();
+	if (IsImmediate(value, Type::U32)) return value.U32();
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth >= 8u) return UINT32_MAX;
+	const auto upper = [&](size_t arg) {
+		return UnsignedUpperBound(Arg(*inst, arg), wave_size, depth + 1u);
+	};
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::LaneId:
+			return wave_size == 32u || wave_size == 64u ? wave_size - 1u : UINT32_MAX;
+		case ValueOpcode::BitwiseAnd32: return std::min(upper(0), upper(1));
+		case ValueOpcode::BitCount32: return std::bit_width(upper(0));
+		case ValueOpcode::SelectU32: return std::max(upper(1), upper(2));
+		case ValueOpcode::BitFieldInsert: {
+			const auto base = Arg(*inst, 0), offset = Arg(*inst, 2);
+			if (!IsImmediate(base, Type::U32) || base.U32() != 0u ||
+			    !IsImmediate(offset, Type::U32) || offset.U32() != 0u) return UINT32_MAX;
+			const auto count = upper(3);
+			return count < 32u ? (uint32_t{1} << count) - 1u : UINT32_MAX;
+		}
+		default: return UINT32_MAX;
+	}
+}
+
+void FoldUnsignedRange(Inst& inst, uint32_t wave_size) {
+	const auto opcode = inst.GetOpcode();
+	if (opcode != ValueOpcode::ULessThan32 && opcode != ValueOpcode::ULessThanEqual32 &&
+	    opcode != ValueOpcode::UGreaterThan32 && opcode != ValueOpcode::UGreaterThanEqual32) return;
+	auto lhs = Arg(inst, 0), rhs = Arg(inst, 1);
+	if (opcode == ValueOpcode::UGreaterThan32 || opcode == ValueOpcode::UGreaterThanEqual32)
+		std::swap(lhs, rhs);
+	const auto lower = [](Value value) { return IsImmediate(value, Type::U32) ? value.U32() : 0u; };
+	const bool equal = opcode == ValueOpcode::ULessThanEqual32 ||
+	                   opcode == ValueOpcode::UGreaterThanEqual32;
+	const auto lhs_max = UnsignedUpperBound(lhs, wave_size);
+	const auto rhs_max = UnsignedUpperBound(rhs, wave_size);
+	if (equal ? lhs_max <= lower(rhs) : lhs_max < lower(rhs))
+		Replace(inst, Value(true));
+	else if (equal ? lower(lhs) > rhs_max : lower(lhs) >= rhs_max)
+		Replace(inst, Value(false));
+}
+
 // Full and empty masks have a constant predicate in either wave size. In wave32,
 // ballot projection also survives scalar EXEC operations and loop-carried mask Phis.
 class LaneMaskProjection {
@@ -953,6 +998,7 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 				users.assign(inst->Uses().begin(), inst->Uses().end());
 				operands.clear();
 				for (size_t arg = 0; arg < inst->NumArgs(); ++arg) operands.push_back(inst->Arg(arg));
+				FoldUnsignedRange(*inst, wave_size);
 				mask_projection.Fold(*inst, wave_size);
 				FoldInstruction(*inst->Parent(), location.instruction, worklist);
 				bool changed = opcode != inst->GetOpcode() || operands.size() != inst->NumArgs();

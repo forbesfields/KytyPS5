@@ -12,6 +12,8 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/rectListShader.h"
+#include "graphics/shader/meshEmulation.h"
+#include "graphics/shader/triangleShader.h"
 #include "graphics/shader/shader.h"
 
 #include <chrono>
@@ -125,6 +127,10 @@ struct ShaderModule {
 	std::vector<RectListParameter>               rect_parameters;
 	// Indirect mesh draw: a task shader reads the records and launches the groups.
 	bool                                         mesh_task = false;
+	MeshEmulationLayout                          mesh_layout;
+	std::vector<TriangleParameter>               triangle_parameters;
+
+	[[nodiscard]] bool MeshEmulated() const { return mesh_layout.max_vertices != 0u; }
 };
 
 // A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
@@ -188,6 +194,7 @@ public:
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
+		vk::Pipeline            mesh_compute_pipeline = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		// The push constant range's stages, which every update names.
 		vk::ShaderStageFlags    push_stages;

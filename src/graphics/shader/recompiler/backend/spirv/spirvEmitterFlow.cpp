@@ -22,6 +22,14 @@ bool UserDataDwordIndex(const EmitterState& state, IR::ScalarReg reg, uint32_t& 
 }
 
 uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t component) {
+	if (state.MeshEmulated() && component < 2u) {
+		if (kind == IR::StageInputKind::WorkgroupId) {
+			return EmitAddU32(state, EmitInputComponentU32(state, kind, component),
+			                  EmitMeshEmulationHeaderLoad(state, component));
+		}
+		if (kind == IR::StageInputKind::NumWorkgroups)
+			return EmitMeshEmulationHeaderLoad(state, component + 2u);
+	}
 	if (kind == IR::StageInputKind::LocalInvocationIndex) {
 		return EmitLocalInvocationIndex(state);
 	}

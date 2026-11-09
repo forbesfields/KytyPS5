@@ -348,6 +348,13 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
 	} else if (key.stage == ShaderType::Mesh) {
 		module.mesh_task = options.input_info.vertex->indirect_draw;
+		if (options.input_info.vertex->mesh.emulated) {
+			module.mesh_layout = BuildMeshEmulationLayout(module.info.info.outputs,
+			                                                *options.input_info.vertex);
+		}
+	}
+	if (key.stage == ShaderType::Pixel) {
+		module.triangle_parameters = TriangleParameters(*options.input_info.pixel, module.info.info);
 	}
 	// Programs with GPU-selected calls depend on their callees' current code.
 	if (program.call_source == nullptr) {
@@ -479,6 +486,7 @@ PipelineCache::~PipelineCache() {
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& pipeline: pipelines | std::views::values) {
 			m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+			m_graphics.device.destroyPipeline(pipeline.mesh_compute_pipeline, nullptr);
 			m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
 			m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
 		}
@@ -712,41 +720,51 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	if (mesh_active) {
 		auto& mesh              = vertex_info[0].mesh;
-		if (!m_graphics.mesh_shader_enabled) {
-			EXIT("This game requires mesh shaders, but the selected Vulkan device does not support "
-			     "VK_EXT_mesh_shader and no mesh emulation backend is available. "
-			     "shader=0x%016" PRIx64 " threads=%u vertices=%u primitives=%u fast_launch=%u\n",
-			     vertex_params[0].hash, mesh.threads_num[0], mesh.max_vertices,
-			     mesh.max_primitives, static_cast<uint32_t>(mesh.fast_launch));
-		}
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
-		const auto& limits      = m_graphics.mesh_shader_properties;
-		const auto  logical_threads =
-		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
-		const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
-		                          std::min(mesh.host_subgroup_size, mesh.wave_size);
-		if (host_threads > limits.maxMeshWorkGroupInvocations ||
-		    host_threads > limits.maxMeshWorkGroupSize[0] ||
-		    mesh.max_vertices > limits.maxMeshOutputVertices ||
-		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
-		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
-			static std::atomic_bool warned = false;
-			if (!warned.exchange(true, std::memory_order_relaxed)) {
-				Log::WriteToConsoleAndLog(fmt::format(
-				    "Warning: dropping mesh draws the host does not support (shader 0x{:016x}).\n",
-				    vertex_params[0].hash));
+		mesh.emulated = !m_graphics.mesh_shader_enabled;
+		if (mesh.emulated) {
+			const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
+			const auto host_threads = ((mesh.threads_num[0] + mesh.wave_size - 1u) / mesh.wave_size) *
+			                          std::min(mesh.host_subgroup_size, mesh.wave_size);
+			const auto shared_bytes = uint64_t{mesh.lds_size_dwords + mesh.max_vertices + 2u} * 4u;
+			if (host_threads > limits.maxComputeWorkGroupInvocations ||
+			    host_threads > limits.maxComputeWorkGroupSize[0] ||
+			    shared_bytes > limits.maxComputeSharedMemorySize) {
+				EXIT("mesh compute emulation exceeds device limits: shader=0x%016" PRIx64
+				     " host_threads=%u shared_bytes=%" PRIu64 "\n",
+				     vertex_params[0].hash, host_threads, shared_bytes);
 			}
-			return;
-		}
-		// A task shader launches each record's groups and passes its draw parameters in a
-		// payload beside the LDS, the allocation pair and the Layer array; without room for
-		// it, the CPU reads the records.
-		if (state.indirect_draw &&
-		    (mesh.lds_size_dwords + 2u + mesh.max_vertices +
-		     ShaderRecompiler::IR::PushData::MeshTaskPayloadDwordCount) * sizeof(uint32_t) <=
-		        limits.maxMeshPayloadAndSharedMemorySize) {
-			vertex_info[0].indirect_offsets = state.indirect_offsets;
-			vertex_info[0].indirect_draw    = true;
+			// Leave indirect_draw disabled: the existing command processor fallback reads each
+			// record and supplies its draw parameters without requiring a native task shader.
+		} else {
+			const auto& limits = m_graphics.mesh_shader_properties;
+			const auto logical_threads =
+			    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
+			const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
+			                          std::min(mesh.host_subgroup_size, mesh.wave_size);
+			if (host_threads > limits.maxMeshWorkGroupInvocations ||
+			    host_threads > limits.maxMeshWorkGroupSize[0] ||
+			    mesh.max_vertices > limits.maxMeshOutputVertices ||
+			    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
+			    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
+				static std::atomic_bool warned = false;
+				if (!warned.exchange(true, std::memory_order_relaxed)) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "Warning: dropping mesh draws the host does not support (shader 0x{:016x}).\n",
+					    vertex_params[0].hash));
+				}
+				return;
+			}
+			// A task shader launches each record's groups and passes its draw parameters in a
+			// payload beside the LDS, the allocation pair and the Layer array; without room for
+			// it, the CPU reads the records.
+			if (state.indirect_draw &&
+			    (mesh.lds_size_dwords + 2u + mesh.max_vertices +
+			     ShaderRecompiler::IR::PushData::MeshTaskPayloadDwordCount) * sizeof(uint32_t) <=
+			        limits.maxMeshPayloadAndSharedMemorySize) {
+				vertex_info[0].indirect_offsets = state.indirect_offsets;
+				vertex_info[0].indirect_draw    = true;
+			}
 		}
 	}
 	ShaderParams pixel_params;
@@ -764,6 +782,17 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		}
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		pixel_info.object_primitive_id = object_primitive_id;
+#if defined(__APPLE__)
+		const auto primitive = user_config.GetPrimType();
+		pixel_info.emulate_per_vertex = !tess_active &&
+		    (mesh_active || primitive == Prospero::PrimitiveType::kTriList ||
+		     primitive == Prospero::PrimitiveType::kTriStrip || primitive == Prospero::PrimitiveType::kTriFan);
+		if (!mesh_active && !tess_active &&
+		    (primitive == Prospero::PrimitiveType::kTriStrip || primitive == Prospero::PrimitiveType::kTriFan)) {
+			// CPU record handling supplies the count before strip/fan indices are expanded.
+			vertex_info[0].indirect_draw = false;
+		}
+#endif
 		for (uint32_t export_index = 0; export_index < 8u; export_index++) {
 			const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
 			if (slot >= 8u || pixel_info.target_output_mode[export_index] == 0u) continue;
@@ -1015,6 +1044,19 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
 	static_params.topology                 = state.topology;
 	static_params.primitive_restart_enable = state.primitive_restart_enable;
+	if (stages[0]->MeshEmulated()) {
+		static_params.topology = vk::PrimitiveTopology::eTriangleList;
+		static_params.primitive_restart_enable = false;
+	}
+	if (ps_active && !stages[3]->triangle_parameters.empty()) {
+		EXIT_IF(tessellation || (mesh && !stages[0]->MeshEmulated()) ||
+		        (static_params.topology != vk::PrimitiveTopology::eTriangleList &&
+		         static_params.topology != vk::PrimitiveTopology::eTriangleStrip &&
+		         static_params.topology != vk::PrimitiveTopology::eTriangleFan));
+		static_params.topology = vk::PrimitiveTopology::ePatchList;
+		static_params.primitive_restart_enable = false;
+		static_params.patch_control_points = 3u;
+	}
 	static_params.samples                  = attachment_samples;
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info.ps_sample_shading;

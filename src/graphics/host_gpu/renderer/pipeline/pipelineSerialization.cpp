@@ -82,8 +82,20 @@ template <class S, class Key> void IoKey(S& io, Key& key) {
 template <class S, class Module> void IoModule(S& io, Module& stage) {
 	// The handle comes from the SPIR-V; stored programs have no function code.
 	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters,
-	       mesh_task] = stage;
-	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task);
+	       mesh_task, mesh_layout, triangle_parameters] = stage;
+	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task,
+	      mesh_layout.max_vertices, mesh_layout.max_primitives, mesh_layout.vertex_dwords,
+	      mesh_layout.provoking_vertex);
+	auto count = static_cast<uint32_t>(mesh_layout.fields.size());
+	IoAll(io, count);
+	if constexpr (ShaderRecompiler::IR::Reading<S>) mesh_layout.fields.resize(io.Count(count));
+	for (auto& field : mesh_layout.fields) IoAll(io, field.output, field.offset);
+	count = static_cast<uint32_t>(triangle_parameters.size());
+	IoAll(io, count);
+	if constexpr (ShaderRecompiler::IR::Reading<S>) triangle_parameters.resize(io.Count(count));
+	for (auto& parameter : triangle_parameters)
+		IoAll(io, parameter.input_location, parameter.output_location, parameter.per_vertex,
+		      parameter.flat, parameter.no_perspective, parameter.source);
 }
 
 } // namespace
