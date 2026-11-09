@@ -167,10 +167,17 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
 		bytes.resize(read);
 	}
+#if defined(__APPLE__)
+	// Metal pipeline compilation can consume substantial memory for each concurrent job.
+	// Keep cache warm-up serial on unified-memory Macs.
+	const size_t warmup_threads = 1u;
+#else
+	const auto warmup_threads = Common::ParallelThreads();
+#endif
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Shader cache: compiling shaders and pipelines from {} ({:.1f} MB) with {} threads\n",
 	    Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0,
-	    Common::ParallelThreads()));
+	    warmup_threads));
 	auto       records = std::span<const uint8_t>(bytes);
 	const bool reusable =
 	    records.size() >= header.size() && std::ranges::equal(records.first(header.size()), header);
@@ -198,7 +205,11 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			});
 		}
 	}
-	Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
+	if (warmup_threads == 1u) {
+		for (auto& job : jobs) job();
+	} else {
+		Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
+	}
 	// A key with a stage missing from the store keeps no pipeline.
 	std::erase_if(m_graphics_pipelines,
 	              [](const auto& entry) { return entry.second.pipeline == nullptr; });
