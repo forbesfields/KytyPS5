@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <type_traits>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -663,8 +664,21 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 
 template <typename Emit>
 auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t result_type,
-                     const Emit& emit) {
+                     const Emit& access) {
 	auto& state = ctx.state;
+	const auto emit = [&](uint32_t resource, uint32_t array_index) {
+		// A null guest T# returns zero and discards stores/atomics. Do not send a null
+		// descriptor to drivers which cannot bind one (including MoltenVK).
+		if (state.program.info.images[resource].is_null &&
+		    !state.program.info.images[resource].heap) {
+			if constexpr (std::is_void_v<decltype(access(resource, array_index))>) {
+				return;
+			} else {
+				return state.builder.Constant(spv::OpConstantNull, result_type);
+			}
+		}
+		return access(resource, array_index);
+	};
 	const auto& mem = ctx.Memory(inst);
 	const auto& image = state.program.info.images.at(mem.resource);
 	if (image.indirect_root != mem.resource) return emit(mem.resource, 0u);
@@ -701,7 +715,8 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	const auto SameType = [&](uint32_t lhs, uint32_t rhs) {
 		const auto& first = state.program.info.images[lhs];
 		const auto& second = state.program.info.images[rhs];
-		return first.dimension == second.dimension && first.cube == second.cube &&
+		return first.is_null == second.is_null &&
+		       first.dimension == second.dimension && first.cube == second.cube &&
 		       IR::DescriptorBindingForImage(first) == IR::DescriptorBindingForImage(second) &&
 		       (inst.GetOpcode() != IR::ValueOpcode::ImageWrite ||
 		        first.shader_swizzle == second.shader_swizzle) &&
@@ -761,7 +776,9 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 	const bool dref = HasFlag(mem, Decoder::ImageSampleFlagCompare);
 	const bool scalar = dref && !gather;
 	const bool mixed = std::ranges::any_of(image.indirect_resources, [&](uint32_t resource) {
-		return state.program.info.images[resource].numeric_class != image.numeric_class;
+		const auto& candidate = state.program.info.images[resource];
+		// Null candidates must bypass the typed candidate's conversion and constant swizzles.
+		return candidate.is_null || candidate.numeric_class != image.numeric_class;
 	});
 	const auto native_type = [&](uint32_t resource) {
 		return scalar ? TypeF32(state) : ImageVectorType(
@@ -865,6 +882,12 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  image_arg = inst.Arg(0);
 	ctx.ResourceIndex(image_arg, IR::ValueOpcode::GetImageResource);
 	const auto& image   = state.program.info.images.at(mem.resource);
+	if (image.is_null && !image.heap && image.indirect_root != mem.resource) {
+		if (op != IR::ValueOpcode::ImageWrite) {
+			ctx.Define(inst, state.builder.Constant(spv::OpConstantNull, TypeId(state, inst.GetType())));
+		}
+		return;
+	}
 	const auto* address = ctx.ImageAddress(inst.Arg(image_info.needs_sampler ? 2 : 1));
 	if (op == IR::ValueOpcode::ImageQueryDimensions) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);

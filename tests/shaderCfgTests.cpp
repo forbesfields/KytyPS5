@@ -1516,7 +1516,7 @@ ImageTestUserData(Prospero::ImageType type = Prospero::ImageType::kColor2D) {
     data[start] = 0x1000u + start * 0x100u;
     data[start + 1u] = static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm)
                        << 20u;
-    data[start + 2u] = UINT32_MAX;
+    data[start + 2u] = 0u; // Reserved texture bits must be clear, including the next descriptor's tail.
     data[start + 3u] = static_cast<uint32_t>(type) << 28u;
   }
   return data;
@@ -5959,7 +5959,14 @@ void TestNullImageTakesDeclaredCube() {
   const auto cube = specialize({0x100u, static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm) << 20u,
                                 0u, DstSel(4, 5, 6, 7) |
                                     (static_cast<uint32_t>(Prospero::ImageType::kCube) << 28u)});
-  Check(cube.images.size() == 1u && cube.images[0].cube && specialize({}) == cube,
+  auto null_cube = specialize({});
+  Check(null_cube.images.size() == 1u && null_cube.images[0].cube,
+        "a null T# lost its declared cube type");
+#if defined(__APPLE__)
+  Check(null_cube.images[0].is_null, "a null cube requires a native descriptor on macOS");
+  null_cube.images[0].is_null = false;
+#endif
+  Check(cube.images.size() == 1u && cube.images[0].cube && null_cube == cube,
         "a null T# sampled as a cube specialized as another image type");
 }
 
@@ -13513,10 +13520,15 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--null-image-specialization-only") == 0) {
+    TestNullImageTakesDeclaredCube();
+    std::puts("ShaderCfgTests: null image cube specialization passed");
+    return 0;
+  }
   TestVop3FloatConversionDecode();
   TestRayTracingInstructions();
   TestShaderBufferResourceSize();

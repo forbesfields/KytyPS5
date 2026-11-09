@@ -929,6 +929,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		}
 		image.mip_count = ImageMipCount(base, descriptor);
 		// A null T# reads zero; it keeps the dimension and cube its instructions declare.
+#if defined(__APPLE__)
+		// MoltenVK cannot bind native null image descriptors.
+		image.is_null = NullImageDescriptor(descriptor);
+#endif
 		if (NullImageDescriptor(descriptor)) {
 			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
 			                                  : Prospero::TextureNumericClass::Float;
@@ -1877,6 +1881,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.cube                       = source.cube;
 		image.skip_degamma               = source.skip_degamma;
 		image.heap                       = source.heap;
+		image.is_null                    = source.is_null;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {

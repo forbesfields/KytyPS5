@@ -415,6 +415,9 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
               snapshot.images.size() == 1u &&
               specialization.images[0].indirect_root == ImageResource::NoIndirectImage &&
+#if defined(__APPLE__)
+              specialization.images[0].is_null &&
+#endif
               std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t word) { return word == 0u; }),
           "empty image table did not specialize as a safe null image");
   }

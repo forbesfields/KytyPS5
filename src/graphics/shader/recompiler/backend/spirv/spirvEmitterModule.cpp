@@ -244,6 +244,10 @@ void DefineDescriptors(EmitterState& state) {
 	}
 	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
 	for (auto& image: info.images) {
+		if (image.is_null && !image.heap) {
+			image.descriptor_index = UINT32_MAX;
+			continue;
+		}
 		const auto kind = IR::DescriptorBindingForImage(image);
 		if (!kind.has_value() || image.mip_count == 0u ||
 		    (image.mip_mode != IR::ImageMipMode::Dynamic && image.mip_count != 1u)) {
