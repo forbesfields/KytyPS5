@@ -122,33 +122,56 @@ Bytes Pfsc(const Bytes &image) {
   Put(result, 48 + count * 8, result.size(), 8);
   return result;
 }
-Bytes Pfs(const Bytes &pfsc) {
+Bytes Pfs(const Bytes &pfsc, unsigned mode = 8, bool fragmented = false,
+          bool uroot = false) {
   const auto count = (pfsc.size() + Unit - 1) / Unit;
-  Bytes image((3 + count) * Unit);
+  const bool signedNodes = (mode & 1) != 0, wide = (mode & 2) != 0;
+  const size_t stride = signedNodes ? (wide ? 0x310 : 0x2c8) : 0xa8;
+  const size_t width = wide ? 8 : 4, step = width + (signedNodes ? 32 : 0);
+  const size_t ptr = (wide ? 0x68 : 0x64) + (signedNodes ? 32 : 0);
+  const size_t dataBlock = uroot ? 4 : 3;
+  Bytes image((dataBlock + count) * Unit);
   Put(image, 0, 2, 8);
   Put(image, 8, 20130315, 8);
-  Put(image, 0x1c, 8, 2);
+  Put(image, 0x1c, mode, 2);
   Put(image, 0x20, Unit, 4);
-  Put(image, 0x30, 2, 8);
+  Put(image, 0x30, uroot ? 3 : 2, 8);
   Put(image, 0x40, 1, 8);
-  Put(image, Unit, 0x4000, 2);
-  Put(image, Unit + 8, 32, 8);
-  Put(image, Unit + 0x60, 1, 4);
-  Put(image, Unit + 0x64, 2, 4);
-  const auto inode = Unit + 0xa8;
+  auto directory = [&](size_t inode, size_t block, size_t child, bool root) {
+    const auto node = Unit + inode * stride;
+    Put(image, node, 0x4000, 2);
+    Put(image, node + 8, 32, 8);
+    Put(image, node + 0x60, 1, width);
+    Put(image, node + ptr, block, width);
+    const auto p = Unit * block;
+    Put(image, p, child, 4);
+    Put(image, p + 4, root ? 3 : 2, 4);
+    Put(image, p + 8, root ? 5 : 10, 4);
+    Put(image, p + 12, 32, 4);
+    Text(image, p + 16, root ? "uroot" : "test.exfat");
+  };
+  directory(0, 2, 1, uroot);
+  if (uroot)
+    directory(1, 3, 2, false);
+  const auto inode = Unit + (uroot ? 2 : 1) * stride;
   Put(image, inode, 0x8000, 2);
   Put(image, inode + 4, 1, 4);
   Put(image, inode + 8, pfsc.size(), 8);
   Put(image, inode + 16, Unit * 40, 8);
-  Put(image, inode + 0x60, count, 4);
-  Put(image, inode + 0x64, 3, 4);
-  Put(image, inode + 0x68, 0xffffffff, 4);
-  Put(image, Unit * 2, 1, 4);
-  Put(image, Unit * 2 + 4, 2, 4);
-  Put(image, Unit * 2 + 8, 10, 4);
-  Put(image, Unit * 2 + 12, 32, 4);
-  Text(image, Unit * 2 + 16, "test.exfat");
-  std::copy(pfsc.begin(), pfsc.end(), image.begin() + Unit * 3);
+  Put(image, inode + 0x60, count, width);
+  if (!fragmented) {
+    Put(image, inode + ptr, dataBlock, width);
+    Put(image, inode + ptr + step, wide ? UINT64_MAX : UINT32_MAX, width);
+    std::copy(pfsc.begin(), pfsc.end(), image.begin() + Unit * dataBlock);
+  } else {
+    Check(count <= 12, "fragmented fixture fits direct PFS pointers");
+    for (size_t i = 0; i < count; ++i) {
+      const auto block = dataBlock + count - i - 1;
+      Put(image, inode + ptr + i * step, block, width);
+      const auto take = std::min(Unit, pfsc.size() - i * Unit);
+      std::copy_n(pfsc.begin() + i * Unit, take, image.begin() + block * Unit);
+    }
+  }
   return image;
 }
 void Save(const std::filesystem::path &path, const Bytes &bytes) {
@@ -205,6 +228,48 @@ void Synthetic(const std::filesystem::path &dir) {
   Check(write.IsInvalid(), "reject writes");
   Check(!Common::GetArchiveInfo(root / ".." / "eboot.bin"), "reject traversal");
 
+  for (unsigned mode : {8u, 9u, 11u}) {
+    for (bool fragmented : {false, true}) {
+      const auto variant =
+          dir / ("mode" + std::to_string(mode) +
+                 (fragmented ? "-fragmented" : "") + ".ffpfsc");
+      Save(variant, Pfs(packed, mode, fragmented, true));
+      Common::File variantFile(Common::MakeArchivePath(variant, "eboot.bin"),
+                               Common::File::Mode::Read);
+      Check(!variantFile.IsInvalid() &&
+                Read(variantFile, 0, payload.size()) == payload,
+            "signed/wide/fragmented PFS and uroot reads");
+    }
+  }
+  const auto topLevel = dir / "top-level.ffpfsc";
+  Save(topLevel, Pfsc(Pfsc(Pfsc(valid))));
+  Common::File nested(Common::MakeArchivePath(topLevel, "eboot.bin"),
+                      Common::File::Mode::Read);
+  Check(!nested.IsInvalid() && Read(nested, 0, payload.size()) == payload,
+        "nested PFSC layers share cache");
+
+  auto corrupt = packed;
+  uint64_t assetBlock = 0;
+  for (size_t i = 0; i < 8; ++i)
+    assetBlock |= uint64_t(corrupt[48 + 3 * 8 + i]) << (i * 8);
+  corrupt[assetBlock + 5] ^= 0x80;
+  const auto damagedPath = dir / "damaged-asset.ffpfsc";
+  Save(damagedPath, Pfs(corrupt));
+  Common::File damaged(Common::MakeArchivePath(damagedPath, "eboot.bin"),
+                       Common::File::Mode::Read);
+  Check(!damaged.IsInvalid(),
+        "corrupt asset does not prevent opening valid metadata");
+  Bytes damagedBytes(payload.size());
+  uint32_t damagedCount = 99;
+  Check(
+      !damaged.Read(damagedBytes.data(), damagedBytes.size(), &damagedCount) &&
+          damagedCount == 0 && damaged.Tell() == 0,
+      "corrupt asset reports failure and preserves cursor");
+  uint32_t eofCount = 99;
+  Check(file.Seek(file.Size()), "seek to EOF");
+  Check(file.Read(damagedBytes.data(), 1, &eofCount) && eofCount == 0,
+        "EOF succeeds and differs from corruption");
+
   auto reject = [&](Bytes bytes, const char *reason) {
     static size_t serial = 0;
     const auto bad = dir / ("bad" + std::to_string(++serial) + ".ffpfsc");
@@ -253,8 +318,13 @@ void Synthetic(const std::filesystem::path &dir) {
 }
 void Compare(const std::filesystem::path &image,
              const std::filesystem::path &folder) {
+  const auto openStart = std::chrono::steady_clock::now();
   auto reader = Common::OpenArchive(image);
+  const auto openMs = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - openStart)
+                          .count();
   Check(bool(reader), "open real image");
+  std::printf("ImageArchiveTests: image opened in %.3f ms\n", openMs);
   const auto root = Common::MakeArchivePath(image);
   uint64_t total = 0;
   size_t files = 0, randomReads = 0;
@@ -307,6 +377,12 @@ int main(int argc, char **argv) {
            std::chrono::steady_clock::now().time_since_epoch().count()));
   Check(std::filesystem::create_directory(dir), "create test directory");
   Synthetic(dir);
+  if (argc == 3 && std::string(argv[1]) == "--write-corrupt") {
+    Check(std::filesystem::copy_file(dir / "damaged-asset.ffpfsc", argv[2]),
+          "export corrupt fixture without overwriting files");
+    std::filesystem::remove_all(dir);
+    return 0;
+  }
   std::filesystem::remove_all(dir);
   if (argc == 3)
     Compare(argv[1], argv[2]);

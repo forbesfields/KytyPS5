@@ -704,13 +704,13 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	const bool read_ok = file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 
 	file->mutex.Unlock();
 
-	if (is_invalid) {
-		LOGF("\tfile is invalid\n");
+	if (is_invalid || (!read_ok && bytes_read == 0)) {
+		LOGF("\tfile read failed\n");
 		return KERNEL_ERROR_EIO;
 	}
 
@@ -832,14 +832,14 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	const bool read_ok = file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();
 
-	if (is_invalid) {
-		LOGF("\tfile is invalid\n");
+	if (is_invalid || (!read_ok && bytes_read == 0)) {
+		LOGF("\tfile read failed\n");
 		return KERNEL_ERROR_EIO;
 	}
 
@@ -934,8 +934,12 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		const auto count = static_cast<uint32_t>(std::min<uint64_t>(buffer.iov_len, remaining));
 		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
 		uint32_t bytes = 0;
-		file->f.Read(buffer.iov_base, count, &bytes);
+		const bool read_ok = file->f.Read(buffer.iov_base, count, &bytes);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes);
+		if (!read_ok && bytes_read == 0 && bytes == 0) {
+			file->f.Seek(position);
+			return KERNEL_ERROR_EIO;
+		}
 		bytes_read += bytes;
 		remaining -= bytes;
 		if (bytes < count) {

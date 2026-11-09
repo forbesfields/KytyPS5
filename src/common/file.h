@@ -68,7 +68,8 @@ public:
 
 	[[nodiscard]] std::optional<Times> GetTimes() const;
 
-	void Read(void* data, uint32_t size, uint32_t* bytes_read = nullptr);
+	// False reports an archive I/O failure; an ordinary EOF is successful with zero bytes.
+	bool Read(void* data, uint32_t size, uint32_t* bytes_read = nullptr);
 	void Write(const void* data, uint32_t size, uint32_t* bytes_written = nullptr);
 
 	void Printf(const char* format, ...) KYTY_FORMAT_PRINTF(2, 3);
