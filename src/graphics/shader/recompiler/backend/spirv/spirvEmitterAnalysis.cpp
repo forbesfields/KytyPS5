@@ -3,12 +3,20 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/triangleShader.h"
 
 #include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr) {
+	if (state.program.stage == ShaderType::Pixel && state.input_info.pixel->emulate_per_vertex) {
+		const auto mapped = ShaderPixelParameterMappedLocation(*state.input_info.pixel, attr);
+		for (const auto& parameter : TriangleParameters(*state.input_info.pixel, state.program.info)) {
+			if (parameter.source == IR::StageInputKind::Parameter && parameter.input_location == mapped)
+				return parameter.output_location;
+		}
+	}
 	std::array<uint32_t, 32> active_inputs {};
 	uint32_t                 active_count = 0;
 	for (const auto& input: state.inputs) {

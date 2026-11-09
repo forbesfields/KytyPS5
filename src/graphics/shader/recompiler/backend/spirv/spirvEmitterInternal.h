@@ -147,6 +147,11 @@ struct EmitterState {
 	uint32_t                   mesh_primitives                       = 0;
 	uint32_t                   mesh_cull                             = 0;
 	uint32_t                   mesh_payload                          = 0;
+	uint32_t                   mesh_output_buffer                    = 0;
+
+	[[nodiscard]] bool MeshEmulated() const {
+		return program.stage == ShaderType::Mesh && input_info.vertex->mesh.emulated;
+	}
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
@@ -171,6 +176,7 @@ struct EmitterState {
 	std::vector<uint32_t>      interface_variables;
 };
 
+uint32_t EmitMeshEmulationHeaderLoad(EmitterState& state, uint32_t index);
 uint32_t TypeVoid(EmitterState& state);
 uint32_t TypeBool(EmitterState& state);
 uint32_t TypeBoolVector(EmitterState& state, uint32_t components);

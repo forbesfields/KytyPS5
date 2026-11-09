@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
 #include <span>
 #include <vector>
 
@@ -156,15 +157,27 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const auto* pixel         = stages[3];
 	const bool  with_depth    = rendering.depth_format != vk::Format::eUndefined ||
 	                            rendering.stencil_format != vk::Format::eUndefined;
-	const bool  mesh          = vertex.info.stage == ShaderType::Mesh;
+	const bool  emulated_mesh = vertex.MeshEmulated();
+	const bool  mesh          = vertex.info.stage == ShaderType::Mesh && !emulated_mesh;
 	EXIT_NOT_IMPLEMENTED(mesh && !graphics.mesh_shader_enabled);
-	const bool rect_list = static_params.patch_control_points != 0 && stages[1] == nullptr;
+	const auto mesh_vertex_module = emulated_mesh
+	    ? CompileSPV(BuildMeshEmulationVertexShader(vertex.mesh_layout,
+	                                               vertex.mesh_layout.provoking_vertex), graphics.device)
+	    : vk::ShaderModule{};
+	const bool triangle_corners = pixel != nullptr && !pixel->triangle_parameters.empty();
+	const bool rect_list = !triangle_corners && static_params.patch_control_points != 0 && stages[1] == nullptr;
 
 	vk::ShaderModule tess_control_shader_module = nullptr;
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
 	const auto       task_module =
 	    vertex.mesh_task ? CompileSPV(GPU_MESH_INDIRECT_SPV, graphics.device) : vk::ShaderModule {};
 
+	if (triangle_corners) {
+		const auto shaders = BuildTriangleShaders(pixel->triangle_parameters,
+		    RectListClipDistances(vertex.info), static_params.provoking_vtx_last ? 2u : 0u);
+		tess_control_shader_module = CompileSPV(shaders.control, graphics.device);
+		tess_eval_shader_module = CompileSPV(shaders.evaluation, graphics.device);
+	}
 	if (rect_list) {
 		std::span<const RectListParameter> parameters;
 		if (pixel != nullptr) parameters = pixel->rect_parameters;
@@ -178,9 +191,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	uint32_t                          shader_stage_count = 0;
 	for (const auto* stage: stages) {
 		if (stage != nullptr) {
-			shader_stages[shader_stage_count++] = {.stage  = NativeShaderStage(stage->info.stage),
-			                                       .module = stage->module,
-			                                       .pName  = "main"};
+			shader_stages[shader_stage_count++] = {
+			    .stage = stage->MeshEmulated() ? vk::ShaderStageFlagBits::eVertex : NativeShaderStage(stage->info.stage),
+			    .module = stage->MeshEmulated() ? mesh_vertex_module : stage->module,
+			    .pName = "main"};
 		}
 	}
 	if (task_module) {
@@ -188,7 +202,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		                                       .module = task_module,
 		                                       .pName  = "main"};
 	}
-	if (rect_list) {
+	if (rect_list || triangle_corners) {
 		shader_stages[shader_stage_count++] = {.stage =
 		                                           vk::ShaderStageFlagBits::eTessellationControl,
 		                                       .module = tess_control_shader_module,
@@ -297,13 +311,28 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 	for (const auto* stage: stages) {
 		if (stage != nullptr) {
-			const auto native_stage = NativeShaderStage(stage->info.stage);
+			const auto native_stage = stage->MeshEmulated() ? vk::ShaderStageFlagBits::eCompute
+			                                                : NativeShaderStage(stage->info.stage);
 			AddLayoutBindings(descriptor_bindings, stage->info, native_stage);
 			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
 			pipeline.push_stages |= native_stage;
 		}
 	}
+	if (emulated_mesh) {
+		pipeline.push_stages |= vk::ShaderStageFlagBits::eVertex;
+		descriptor_bindings.push_back({MeshEmulationBinding, vk::DescriptorType::eStorageBuffer, 1u,
+		    vk::ShaderStageFlagBits::eCompute | vk::ShaderStageFlagBits::eVertex, nullptr});
+	}
 	CreateLayouts(graphics, pipeline, descriptor_bindings);
+	if (emulated_mesh) {
+		vk::ComputePipelineCreateInfo compute_info{};
+		compute_info.stage = {.stage = vk::ShaderStageFlagBits::eCompute, .module = vertex.module,
+		                      .pName = "main"};
+		compute_info.layout = pipeline.pipeline_layout;
+		const auto result = graphics.device.createComputePipelines(driver_cache, 1u, &compute_info,
+		    nullptr, &pipeline.mesh_compute_pipeline);
+		EXIT_IF(result != vk::Result::eSuccess);
+	}
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
 
@@ -362,11 +391,19 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
 	                                                            nullptr, &pipeline.pipeline);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("graphics pipeline creation failed: result=%s topology=%u patch_points=%u "
+		     "vertex=0x%016" PRIx64 " pixel=0x%016" PRIx64 " mesh=%u emulated_mesh=%u "
+		     "corner_parameters=%zu rectangle=%u\n", vk::to_string(result).c_str(),
+		     static_cast<uint32_t>(static_params.topology), static_params.patch_control_points,
+		     vertex.id, pixel ? pixel->id : uint64_t{0}, mesh, emulated_mesh,
+		     pixel ? pixel->triangle_parameters.size() : size_t{0}, rect_list);
+	}
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	graphics.device.destroyShaderModule(task_module, nullptr);
+	graphics.device.destroyShaderModule(mesh_vertex_module, nullptr);
 }
 
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,

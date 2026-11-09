@@ -427,19 +427,12 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	return view;
 }
 
-static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, bool metadata,
+bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, bool metadata,
                                   uint32_t view_levels, uint32_t& base_level) {
 	if (!info.IsTiled()) {
 		return false;
 	}
 	ImageInfo physical = info;
-	// A view entirely past MAX_MIP addresses its own chain starting at its base mip (PPSA02110
-	// compresses mip 1 through a T# that declares one level).
-	if (base_level >= physical_levels) {
-		const auto mip  = info.MipExtent(base_level);
-		physical.extent = {mip.width, mip.height, info.IsVolume() ? mip.depth : 1u};
-		physical_levels = view_levels;
-	}
 	physical.resources.levels = physical_levels;
 	physical.UpdateSize();
 	info.UpdateSize();
@@ -462,6 +455,18 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 		if (matches) {
 			return true;
 		}
+	}
+	// First keep extensions within the existing mip tail. They use the same allocation and
+	// leave all declared physical mips unchanged (PPSA21564 writes mip 6 with MAX_MIP 5).
+	// Only then try a standalone chain for views entirely past MAX_MIP (PPSA02110).
+	if (base_level >= physical_levels) {
+		const auto mip = info.MipExtent(base_level);
+		physical = info;
+		physical.data.size = 0;
+		physical.extent = {mip.width, mip.height, info.IsVolume() ? mip.depth : 1u};
+		physical_levels = view_levels;
+		physical.resources.levels = physical_levels;
+		physical.UpdateSize();
 	}
 	if (metadata ||
 	    (info.TransferLayers() > 1 && physical.tiled_slice_stride != info.tiled_slice_stride)) {
@@ -611,9 +616,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
 		                           view_base)) {
 			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
-			     "extent=%ux%ux%u tile=%u\n",
+			     "extent=%ux%ux%u tile=%u metadata=%u storage=%u format=%u "
+			     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
 			     base_level, last_level, max_mip, width, height, depth,
-			     static_cast<uint32_t>(tile));
+			     static_cast<uint32_t>(tile), descriptor.MetaCompress(), storage,
+			     static_cast<uint32_t>(format), descriptor.fields[0], descriptor.fields[1],
+			     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+			     descriptor.fields[6], descriptor.fields[7]);
 		}
 	} else {
 		desc.info.UpdateSize();
@@ -730,6 +739,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
+	prepared.mesh_output = {};
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
@@ -945,7 +955,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				image_descriptor_count += count;
 			}
 		}
-		EXIT_IF(!(pipeline.push_stages & NativeShaderStage(program.stage)));
+		EXIT_IF(!(pipeline.push_stages & (prepared->runtime->module->MeshEmulated()
+		    ? vk::ShaderStageFlagBits::eCompute : NativeShaderStage(program.stage))));
 	}
 	if (pipeline.uses_image_heap) {
 		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
@@ -961,7 +972,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		if (descriptors.gds.buffer != nullptr) {
 			buffer.EndRendering();
 			const auto barrier       = MakeGdsDependency(descriptors.gds.buffer);
-			const auto shader_stages = ShaderPipelineStages(NativeShaderStage(program.stage));
+			const auto shader_stages = ShaderPipelineStages(prepared->runtime->module->MeshEmulated()
+			    ? vk::ShaderStageFlagBits::eCompute : NativeShaderStage(program.stage));
 			vk_buffer.pipelineBarrier(
 			    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
 			        vk::PipelineStageFlagBits::eAllGraphics |
@@ -1080,6 +1092,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 
+		if (prepared->runtime->module->MeshEmulated()) {
+			EXIT_IF(descriptors.mesh_output.buffer == nullptr);
+			m_descriptor_writes.push_back({.dstBinding = MeshEmulationBinding, .descriptorCount = 1u,
+			    .descriptorType = vk::DescriptorType::eStorageBuffer,
+			    .pBufferInfo = &descriptors.mesh_output});
+		}
 		if (program.bindings.UsesPushData()) {
 			std::ranges::copy(prepared->shader_data,
 			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);

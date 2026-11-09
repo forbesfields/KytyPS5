@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -27,6 +28,8 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/meshEmulation.h"
+#include "graphics/shader/triangleShader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "libs/agc.h"
 #include "spirv-tools/libspirv.hpp"
@@ -1253,6 +1256,29 @@ void TestNormalizedImageContracts() {
         "Vulkan image-view compatibility classes diverged from production");
 }
 
+void TestExtendedTextureMipViews() {
+  ImageInfo chain{};
+  chain.data.address = 0x560040000ull;
+  chain.pixel_format = vk::Format::eR16G16B16A16Sfloat;
+  chain.guest_format = Prospero::BufferFormat::k16_16_16_16Float;
+  chain.extent = {1920, 1080, 1};
+  chain.resources = {7, 1};
+  chain.tile_mode = Prospero::TileMode::kRenderTarget;
+  auto physical = chain;
+  physical.resources.levels = 6;
+  physical.UpdateSize();
+  chain.UpdateSize();
+  std::printf("Mip tail: first=%u/%u bytes=%llu/%llu\n", chain.first_tail_level,
+    physical.first_tail_level, static_cast<unsigned long long>(chain.data.size),
+    static_cast<unsigned long long>(physical.data.size));
+  Check(chain.first_tail_level == physical.first_tail_level && chain.data.size == physical.data.size,
+        "captured mip extension changed the physical allocation");
+  uint32_t base = 6;
+  Check(ResolveTextureMipView(chain, 6, false, 1, base) && base == 6u &&
+            chain.extent == vk::Extent3D{1920, 1080, 1} && chain.resources.levels == 7u,
+        "mip within an existing tail was incorrectly rebased as a standalone texture");
+}
+
 void TestRebasedTextureMipViews() {
   constexpr auto format = Prospero::BufferFormat::k16_16_16_16Float;
   constexpr auto tile = Prospero::TileMode::kStandard4KB;
@@ -1920,16 +1946,11 @@ void TestNggVertexEntryState() {
     options.input_info.vertex = &input;
     options.wave_size = input.wave_size;
     const auto result = RecompileForTest(params.code, options);
-    bool live_vertex_range = false;
-    for (const auto *block : result.program.blocks) {
-      for (const auto &inst : *block) {
-        if (inst.GetOpcode() == IR::ValueOpcode::UGreaterThan32) {
-          const auto count = inst.Arg(0).Resolve();
-          live_vertex_range |= count.IsImmediate() && count.U32() == wave_size;
-        }
-      }
-    }
-    Check(live_vertex_range && std::ranges::any_of(result.program.info.outputs,
+    // Constant launch predicates can disappear. The exported vertex must still
+    // depend on the vertex ID, rather than being suppressed by the NGG prologue.
+    const bool uses_vertex_id = std::ranges::any_of(result.program.info.inputs,
+        [](const auto& input) { return input.kind == IR::StageInputKind::VertexIndex; });
+    Check(uses_vertex_id && std::ranges::any_of(result.program.info.outputs,
               [](const auto &output) {
                 return output.kind == IR::StageOutputKind::Position;
               }),
@@ -1937,6 +1958,42 @@ void TestNggVertexEntryState() {
     Check(result.program.wave_size == wave_size,
           "NGG wave size was lost during translation");
     CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
+void TestUnsignedLaunchRanges() {
+  using namespace ShaderRecompiler::IR;
+  for (const uint32_t wave : {32u, 64u}) {
+    Block block;
+    IREmitter e(&block);
+    const auto lane = U32(e.Emit(ValueOpcode::LaneId));
+    const auto raw = e.GetUserData(static_cast<ScalarReg>(0));
+    const auto count = U32(e.Emit(ValueOpcode::BitCount32, {raw}));
+    const auto bits = e.BitwiseAnd(raw, U32(Value(31u)));
+    const auto mask = e.Emit(ValueOpcode::BitFieldInsert,
+                            {Value(0u), Value(UINT32_MAX), Value(0u), bits});
+    const auto masked_count = U32(e.Emit(ValueOpcode::BitCount32, {mask}));
+    const auto live = e.ULessThan(lane, U32(Value(wave)));
+    const auto boundary = e.ULessThan(lane, U32(Value(wave - 1u)));
+    const auto full_count = e.ULessThan(count, U32(Value(32u)));
+    const auto count_limit = e.ULessThan(count, U32(Value(33u)));
+    const auto mask_limit = e.ULessThan(masked_count, U32(Value(32u)));
+    const auto mask_boundary = e.ULessThan(masked_count, U32(Value(31u)));
+    const auto never = e.UGreaterThan(U32(Value(0u)), count);
+    const auto upper_half = e.Emit(ValueOpcode::UGreaterThanEqual32, {lane, Value(32u)});
+    ConstantPropagationPass({&block}, wave);
+    const auto constant = [](Value value, bool expected) {
+      value = value.Resolve();
+      return value.IsImmediate() && value.U1() == expected;
+    };
+    Check(constant(live, true) && constant(count_limit, true) &&
+              constant(mask_limit, true) && constant(never, false),
+          "unsigned launch bounds failed to fold a proven predicate");
+    Check(!boundary.Resolve().IsImmediate() && !full_count.Resolve().IsImmediate() &&
+              !mask_boundary.Resolve().IsImmediate(),
+          "unsigned launch bounds folded a predicate that varies between lanes or inputs");
+    Check(wave == 32u ? constant(upper_half, false) : !upper_half.Resolve().IsImmediate(),
+          "unsigned launch bounds lost the upper half of a wave64");
   }
 }
 
@@ -1950,19 +2007,41 @@ void TestMetalVertexLaunchMask() {
       EncodeSop2(0x21, 126, 193, 106),
       EncodeExp0(0x0c, 0xf), EncodeExp1(5, 5, 5, 5), EncodeSopp(0x01),
   };
+  // Astro Bot's zero-LDS NGG shader uses MBCNT to form its launch predicates.
+  // Keep that prologue, primitive export and vertex export; replace the resource body.
+  const uint32_t mbcnt_code[] = {
+      0xbfa00003u, 0x93ebff03u, 0x00040018u, 0xbefe03c1u,
+      0x9380ff02u, 0x00090016u, 0x9381ff02u, 0x0009000cu,
+      0xbf8a0000u, 0xbf076b80u, 0xbf850003u, 0x8f6a8c00u,
+      0x887c6a01u, 0xbf900009u, 0x8f6a856bu,
+      0xd7650001u, 0x0000d4c1u, 0x7da80200u, 0xbf880002u,
+      0xf8000941u, 0x00000000u, 0xbf8cff0fu, 0xbefe03c1u,
+      0x7da80201u, EncodeSopp(0x08, 2),
+      EncodeExp0(0x0c, 0xf), EncodeExp1(5, 5, 5, 5), EncodeSopp(0x01),
+  };
   ShaderVertexInputInfo vertex{};
   for (const uint32_t wave_size : {32u, 64u}) {
-    auto options = MakeCompileOptions(ShaderType::Vertex);
-    options.wave_size = wave_size;
-    options.input_info.vertex = &vertex;
-    const auto result = RecompileForTest(code, options);
-    Check(!result.program.info.subgroup_ballot &&
-              !result.program.info.subgroup_local_invocation_id,
-          "NGG launch mask needs unsupported Metal vertex subgroup builtins");
-    Check(std::ranges::any_of(result.program.info.outputs, [](const auto& output) {
-            return output.kind == IR::StageOutputKind::Position;
-          }), "NGG launch mask discarded the vertex position");
-    CheckSpirvBinaryValidates(result.spirv);
+    for (const auto shader : {std::span<const uint32_t>(code), std::span<const uint32_t>(mbcnt_code)}) {
+      auto options = MakeCompileOptions(ShaderType::Vertex);
+      options.wave_size = wave_size;
+      options.input_info.vertex = &vertex;
+      const auto result = RecompileForTest(shader, options);
+      if (shader.data() == mbcnt_code && wave_size == 64u) {
+        // This captured wave32 program writes only EXEC_LO. Running the same words
+        // as wave64 leaves the upper half inactive and must retain a lane predicate.
+        Check(result.program.info.subgroup_local_invocation_id,
+              "wave32 EXEC_LO writes incorrectly enabled the upper half of wave64");
+        CheckSpirvBinaryValidates(result.spirv);
+        continue;
+      }
+      Check(!result.program.info.subgroup_ballot &&
+                !result.program.info.subgroup_local_invocation_id,
+            "NGG launch mask needs unsupported Metal vertex subgroup builtins");
+      Check(std::ranges::any_of(result.program.info.outputs, [](const auto& output) {
+              return output.kind == IR::StageOutputKind::Position;
+            }), "NGG launch mask discarded the vertex position");
+      CheckSpirvBinaryValidates(result.spirv);
+    }
   }
 }
 #endif
@@ -3669,6 +3748,23 @@ void TestNewShaderRecompilerPixelImageSampleLodSelection() {
   }
 }
 
+void TestTriangleIndexExpansion() {
+  const std::array<uint32_t, 5> source{10, 20, 30, 40, 50};
+  Check(ExpandTriangleIndices(Prospero::PrimitiveType::kTriStrip, source, false, 0) ==
+          std::vector<uint32_t>{10,20,30, 20,40,30, 30,40,50},
+        "triangle strip expansion changed winding or the first provoking vertex");
+  Check(ExpandTriangleIndices(Prospero::PrimitiveType::kTriStrip, source, false, 0, true) ==
+          std::vector<uint32_t>{10,20,30, 30,20,40, 30,40,50},
+        "triangle strip expansion changed the last provoking vertex");
+  Check(ExpandTriangleIndices(Prospero::PrimitiveType::kTriFan, source, false, 0) ==
+          std::vector<uint32_t>{20,30,10, 30,40,10, 40,50,10},
+        "triangle fan expansion changed its first provoking vertex");
+  const std::array<uint32_t, 9> restarted{0,1,2,0xffff,3,4,5,6,0xffff};
+  Check(ExpandTriangleIndices(Prospero::PrimitiveType::kTriStrip, restarted, true, 0xffff) ==
+          std::vector<uint32_t>{0,1,2, 3,4,5, 4,6,5},
+        "triangle strip restart did not reset primitive parity");
+}
+
 void TestCustomVintrpMovTranslation() {
   const uint32_t shader[] = {
       EncodeVintrp(2, 12, 0, 3, 2),      EncodeVintrp(2, 13, 0, 3, 0),
@@ -3725,6 +3821,24 @@ void TestCustomVintrpMovTranslation() {
                                             "gl_BaryCoordKHR %uint_0"),
         "guest perspective-center I/J did not map to BaryCoordKHR Y/Z");
   CheckSpirvBinaryValidates(custom_result.spirv);
+
+  custom_ps_info.emulate_per_vertex = true;
+  const auto portable_result = RecompileForTest(shader, options);
+  Check(!SpirvHasDecorationValueWithDecoration(portable_result.spirv, 30u, 0u, 5285u),
+        "portable corner inputs still require unsupported PerVertexKHR");
+  Check(SpirvHasDecorationValueWithDecoration(portable_result.spirv, 30u, 0u, 14u),
+        "portable corner inputs must carry raw bits through flat arrays");
+  Check(!SpirvContainsCapability(portable_result.spirv, 5284u) &&
+            !SpirvHasDecorationValue(portable_result.spirv, 11u, 5286u),
+        "portable triangles still require native Metal barycentric inputs");
+  CheckSpirvBinaryValidates(portable_result.spirv);
+  const auto parameters = TriangleParameters(custom_ps_info, portable_result.program.info);
+  Check(parameters.size() == 2u && parameters[0].per_vertex,
+        "portable corner layout lost the custom parameter");
+  const auto triangle = BuildTriangleShaders(parameters, 2u, 0u);
+  CheckSpirvBinaryValidates(triangle.control);
+  CheckSpirvBinaryValidates(triangle.evaluation);
+  custom_ps_info.emulate_per_vertex = false;
 
   custom_ps_info.custom_interpolation_mask = 0;
   custom_ps_info.interpolator_settings[0] = 0;
@@ -7631,7 +7745,7 @@ void TestFusedShaderHandoffPreservesRegisters() {
 #endif
 }
 
-void TestMeshExportStorage() {
+void TestMeshExportStorage(bool emulated = false) {
   using ShaderRecompiler::IR::PushData;
   const uint32_t front[] = {
       EncodeSMovB32(12, 255), 0x1003u,
@@ -7665,6 +7779,7 @@ void TestMeshExportStorage() {
   mesh.vertices_per_group = 64;
   mesh.max_vertices = 192;
   mesh.max_primitives = 176;
+  mesh.emulated = emulated;
   std::array<uint32_t, 14> user_data{};
   user_data[8] = 0x10000008u;
   user_data[9] = 4u << 16u;
@@ -7700,6 +7815,19 @@ void TestMeshExportStorage() {
     const auto reg = std::ranges::find(result.program.info.user_data_registers, 13u);
     Check(reg != result.program.info.user_data_registers.end(), "mesh shader lost user s13");
     const auto source = DisassembleSpirvBinary(result.spirv);
+    if (emulated) {
+      Check(source.find("OpEntryPoint GLCompute") != std::string::npos &&
+                source.find("MeshShadingEXT") == std::string::npos &&
+                source.find("OpSetMeshOutputsEXT") == std::string::npos &&
+                source.find("TaskPayloadWorkgroupEXT") == std::string::npos,
+            "emulated mesh still requires native mesh or task shader support");
+      const auto output_layout = BuildMeshEmulationLayout(result.program.info.outputs, input);
+      const auto vertex = BuildMeshEmulationVertexShader(output_layout, mesh.provoking_vertex);
+      CheckSpirvBinaryValidates(vertex);
+      Check(DisassembleSpirvBinary(vertex).find("OpEntryPoint Vertex") != std::string::npos,
+            "emulated geometry has no ordinary vertex shader");
+      continue;
+    }
     for (const auto dword :
          {static_cast<uint32_t>(reg - result.program.info.user_data_registers.begin()),
           layout.memory_offset_dword}) {
@@ -13516,6 +13644,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 }
 
 #include "ShaderRayTracingTests.inc"
+#include "MeshEmulationGpuTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
@@ -13524,6 +13653,36 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+#if defined(__APPLE__)
+  if (argc == 2 && std::strcmp(argv[1], "--vertex-launch-only") == 0) {
+    TestUnsignedLaunchRanges();
+    TestNggVertexEntryState();
+    TestMetalVertexLaunchMask();
+    std::puts("ShaderCfgTests: Metal vertex launch masks passed");
+    return 0;
+  }
+#endif
+  if (argc == 2 && std::strcmp(argv[1], "--texture-mip-view-only") == 0) {
+    TestExtendedTextureMipViews();
+    TestRebasedTextureMipViews();
+    std::puts("ShaderCfgTests: texture mip views passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mesh-gpu-only") == 0) {
+    TestMeshEmulationGpu();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--portable-interpolation-only") == 0) {
+    TestTriangleIndexExpansion();
+    TestCustomVintrpMovTranslation();
+    std::puts("ShaderCfgTests: portable triangle interpolation passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mesh-emulation-only") == 0) {
+    TestMeshExportStorage(true);
+    std::puts("ShaderCfgTests: mesh compute and vertex specialization passed");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--null-image-specialization-only") == 0) {
     TestNullImageTakesDeclaredCube();
     std::puts("ShaderCfgTests: null image cube specialization passed");
@@ -13549,6 +13708,7 @@ int main(int argc, char **argv) {
   TestVertexBufferGrouping();
   TestShaderProgramHash();
   TestNggVertexEntryState();
+  TestUnsignedLaunchRanges();
 #if defined(__APPLE__)
   TestMetalVertexLaunchMask();
 #endif
