@@ -22,9 +22,24 @@ struct Profile {
 	bool r8g8_srgb_views = false;
 	// Native float ops: NaN, signed-zero and denormal results may differ from the guest.
 	bool relaxed_float = false;
+	// Host stages with subgroup operations. A stage without them runs each invocation as a
+	// one-lane wave: lane 0 is the only lane, so ballots, votes and lane reads need no host
+	// subgroup. MoltenVK has them in fragment, compute and tessellation control stages only.
+	bool vertex_subgroups                  = true;
+	bool tessellation_evaluation_subgroups = true;
 };
 
 inline constexpr Profile DefaultProfile {};
+
+// The stage runs as one-lane waves: the host stage has no subgroup operations.
+[[nodiscard]] constexpr bool SingleLaneStage(const Profile& profile, ShaderType stage) {
+	switch (stage) {
+		case ShaderType::Vertex:
+		case ShaderType::Local: return !profile.vertex_subgroups;
+		case ShaderType::TessellationEvaluation: return !profile.tessellation_evaluation_subgroups;
+		default: return false;
+	}
+}
 
 // Resets and writes backend IDs and descriptor indices; do not emit the same program concurrently.
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,

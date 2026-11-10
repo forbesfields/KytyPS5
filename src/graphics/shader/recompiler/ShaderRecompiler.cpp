@@ -827,6 +827,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	    .user_data_count  = static_cast<uint32_t>(options.user_data.size()),
 	    .input_info       = options.input_info,
 	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+	    .single_lane      = Spirv::SingleLaneStage(*options.profile, options.stage),
 	};
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " IR TranslateProgram\n", stage,
 	     options.shader_hash);

@@ -497,16 +497,19 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.subgroup_size     = properties11.subgroupSize;
 	graphics.min_subgroup_size = subgroup_control.minSubgroupSize;
 	graphics.max_subgroup_size = subgroup_control.maxSubgroupSize;
+	graphics.subgroup_supported_stages = properties11.subgroupSupportedStages;
 	graphics.compute_subgroup_size_control_enabled =
 	    supported13.subgroupSizeControl == VK_TRUE &&
 	    (subgroup_stages & vk::ShaderStageFlagBits::eCompute) &&
 	    subgroup_control.minSubgroupSize <= 64 && subgroup_control.maxSubgroupSize >= 64;
 
-	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
+	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s"
+	     " operation_stages=0x%08x\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
 	     static_cast<vk::ShaderStageFlags::MaskType>(subgroup_stages),
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
-	     graphics.SupportsComputeWave64() ? "true" : "false");
+	     graphics.SupportsComputeWave64() ? "true" : "false",
+	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.subgroup_supported_stages));
 	graphics.provoking_vertex_last_enabled    = provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled = feedback_layout.attachmentFeedbackLoopLayout &&
 	                                            feedback_dynamic.attachmentFeedbackLoopDynamicState;

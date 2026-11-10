@@ -82,6 +82,7 @@ struct EmitterState {
 		if (ShaderWorkgroupInput(program.stage, input_info) != nullptr) {
 			lds_storage_class = spv::StorageClassWorkgroup;
 		}
+		single_lane = SingleLaneStage(profile, program.stage);
 		if (program.info.uses_lds && program.stage == ShaderType::Compute &&
 		    input_info.compute->lds_storage) {
 			lds_storage_class = spv::StorageClassStorageBuffer;
@@ -111,6 +112,8 @@ struct EmitterState {
 	uint32_t                                         tess_inner_variable = 0;
 
 	uint32_t                                         lane_count              = 1;
+	// The host stage has no subgroup operations: each invocation is a wave of one lane.
+	bool                                             single_lane             = false;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
@@ -397,6 +400,9 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state);
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t lane);
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane);
+// Subgroup ballot and shuffle. A one-lane wave (EmitterState::single_lane) uses no host subgroup.
+uint32_t EmitSubgroupBallot(EmitterState& state, uint32_t predicate);
+uint32_t EmitSubgroupShuffle(EmitterState& state, uint32_t type, uint32_t value, uint32_t lane);
 
 inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32_t, uint32_t>;
 
