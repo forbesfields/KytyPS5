@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
+#include "graphics/host_gpu/renderer/cache/gpuCacheBudget.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -2026,65 +2027,53 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
-void TextureCache::RunGarbageCollector() {
+void TextureCache::RunGarbageCollector(const GpuCacheBudget* unified_budget) {
 	std::scoped_lock lock {m_lock};
-	const uint64_t   tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	const uint64_t tick = m_gc_tick++;
+	auto usage = unified_budget != nullptr ? unified_budget->used
+	             : m_graphics.CanReportMemoryUsage() ? m_graphics.GetDeviceMemoryUsage()
+	                                                : m_total_used_memory;
+	const auto reclaim_level = [&](uint64_t bytes) {
+		if (unified_budget != nullptr) {
+			return unified_budget->Level(bytes);
+		}
+		return bytes >= m_critical_gc_memory ? CacheReclaimLevel::Critical
+		       : bytes >= m_pressure_gc_memory ? CacheReclaimLevel::Pressure
+		       : bytes >= m_trigger_gc_memory   ? CacheReclaimLevel::Normal
+		                                       : CacheReclaimLevel::Idle;
+	};
+	const auto level = reclaim_level(usage);
+	if (level == CacheReclaimLevel::Idle) {
 		return;
 	}
-	const auto collect = [&](bool allow_aggressive) {
-		bool     pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool     aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		uint64_t age        = 16;
-		size_t   deletions  = 10;
-		if (aggressive) {
-			age       = 160;
-			deletions = 40;
-		} else if (pressured) {
-			age       = 80;
-			deletions = 20;
+	const bool pressured = level >= CacheReclaimLevel::Pressure;
+	size_t deletions = level == CacheReclaimLevel::Critical ? 40 : (pressured ? 20 : 10);
+	const uint64_t age = std::min(TextureReclaimAge(level), tick);
+	std::vector<ImageId> candidates;
+	// Deleting depth recursively deletes its stencil association, so finish LRU traversal first.
+	m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) { candidates.push_back(id); });
+	for (const auto id: candidates) {
+		auto owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered || owner->depth_id) {
+			continue;
 		}
-		age = std::min(age, tick);
-		std::vector<ImageId> candidates;
-		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
-		// first.
-		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) { candidates.push_back(id); });
-		for (const auto id: candidates) {
-			if (deletions == 0) {
-				break;
-			}
-			auto owner = m_slot_images.try_get(id);
-			if (owner == nullptr || !owner->registered || owner->depth_id) {
-				continue;
-			}
-			if (owner->heap_refs.load(std::memory_order_relaxed) != 0u) {
-				// Resident heaps sample it without touching it.
-				TouchImage(*owner);
-				continue;
-			}
-			if (owner->SafeToDownload() &&
-			    (!pressured || owner->info.HasStencil() || !DownloadImageMemory(id))) {
-				continue;
-			}
-			--deletions;
-			FreeImage(id);
-			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
-			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
-				deletions >>= 2;
-				aggressive = false;
-			}
-			if (m_total_used_memory < m_pressure_gc_memory && pressured) {
-				deletions >>= 1;
-				pressured = false;
-			}
+		if (owner->heap_refs.load(std::memory_order_relaxed) != 0u) {
+			// Resident heaps sample it without touching it.
+			TouchImage(*owner);
+			continue;
 		}
-	};
-	collect(false);
-	if (m_total_used_memory >= m_critical_gc_memory) {
-		collect(true);
+		if (owner->SafeToDownload() &&
+		    (!pressured || owner->info.HasStencil() || !DownloadImageMemory(id))) {
+			continue;
+		}
+		// VMA includes other renderer allocations. Track the estimated reduction separately
+		// from the logical image-cache bytes, including while destruction is deferred.
+		usage = SubtractBytes(usage, owner->AccountedSize());
+		FreeImage(id);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
+		if (--deletions == 0 || reclaim_level(usage) < level) {
+			break;
+		}
 	}
 }
 

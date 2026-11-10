@@ -15,6 +15,9 @@ namespace Libs::LibKernel::Memory {
 void Initialize();
 void Shutdown();
 
+// Configured guest backing capacity, including direct and flexible memory.
+[[nodiscard]] uint64_t GetBackingCapacity();
+
 // Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never
 // waits on the GPU; call it only while the memory subsystem is initialized.
 struct DebugStats {

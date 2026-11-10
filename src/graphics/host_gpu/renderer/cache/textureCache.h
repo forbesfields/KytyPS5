@@ -21,6 +21,7 @@
 namespace Libs::Graphics {
 
 struct GraphicContext;
+struct GpuCacheBudget;
 class Buffer;
 class BufferCache;
 class CommandBuffer;
@@ -86,7 +87,7 @@ public:
 	[[nodiscard]] bool WriteBackImages();
 	// The tick of the latest write-back pending over the range's pages, or 0 when none is.
 	[[nodiscard]] uint64_t WriteBackTick(uint64_t address, uint64_t size);
-	void RunGarbageCollector();
+	void RunGarbageCollector(const GpuCacheBudget* unified_budget);
 
 private:
 	struct MetaDataInfo {

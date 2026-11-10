@@ -465,6 +465,9 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
 
+add_executable(gpu_cache_budget_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/GpuCacheBudgetTests.cpp")
+target_include_directories(gpu_cache_budget_tests PRIVATE ${inc_headers})
+
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
 )
@@ -709,6 +712,7 @@ if(BUILD_TESTING)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
+	add_test(NAME gpu_cache_budget COMMAND $<TARGET_FILE:gpu_cache_budget_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -850,6 +854,7 @@ if(BUILD_TESTING)
 		vdecsw_tests
 		bit_array_tests
 		lru_cache_tests
+		gpu_cache_budget_tests
 		common_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests

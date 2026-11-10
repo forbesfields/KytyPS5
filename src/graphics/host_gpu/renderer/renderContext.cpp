@@ -1,11 +1,14 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cinttypes>
 
 namespace Libs::Graphics {
 
@@ -15,8 +18,13 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_pipeline_cache(graphics, &m_image_heap, shader_store), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
-      m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler) {
+      m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler),
+      m_unified_cache_limit(graphics.GetUnifiedCacheLimit()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	if (m_unified_cache_limit) {
+		Log::WriteToConsoleAndLog(fmt::format("Unified GPU cache budget: {} MiB\n",
+		                                      *m_unified_cache_limit / (1024 * 1024)));
+	}
 }
 
 RenderContext::~RenderContext() {
@@ -166,8 +174,24 @@ void RenderContext::RunGarbageCollector() {
 	}
 	m_image_heap.RunGarbageCollector();
 	m_texture_cache.ProcessDownloadImages();
-	m_texture_cache.RunGarbageCollector();
-	m_buffer_cache.RunGarbageCollector();
+	if (m_unified_cache_limit) {
+		const GpuCacheBudget budget {m_graphics.GetDeviceMemoryUsage(), *m_unified_cache_limit,
+		                             GraphicContext::GetHostCachePressure()};
+		if (m_budget_log_frame++ % 120 == 0) {
+			using Common::DebugCounters::Counter;
+			using Common::DebugCounters::Get;
+			LOGF("Unified GPU cache: used=%" PRIu64 " MiB limit=%" PRIu64
+			     " MiB level=%u host=%u texture_evictions=%" PRIu64 " buffer_evictions=%" PRIu64 "\n",
+			     budget.used / (1024 * 1024), budget.limit / (1024 * 1024),
+			     static_cast<unsigned>(budget.Level(budget.used)), static_cast<unsigned>(budget.host_level),
+			     Get(Counter::TextureEvictions), Get(Counter::BufferEvictions));
+		}
+		m_texture_cache.RunGarbageCollector(&budget);
+		m_buffer_cache.RunGarbageCollector(&budget);
+	} else {
+		m_texture_cache.RunGarbageCollector(nullptr);
+		m_buffer_cache.RunGarbageCollector(nullptr);
+	}
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
