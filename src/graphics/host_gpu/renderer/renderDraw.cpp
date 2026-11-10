@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/gpuWorkLog.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1056,6 +1057,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		return;
 	}
+	const auto vs_hash = state.vertex_info[0].stage.module->info.shader_hash;
+	const auto ps_hash = state.ps_active ? state.ps_input_info.stage.module->info.shader_hash : 0;
+	if (GpuWorkLog::ShouldSkip(vs_hash) || GpuWorkLog::ShouldSkip(ps_hash)) {
+		return;
+	}
 	const auto  vertex_stages = state.VertexStages();
 	const bool  mesh_active   = state.vertex_info[0].stage.module->info.stage == ShaderType::Mesh;
 	const bool  mesh_task     = state.vertex_info[0].stage.module->mesh_task;
@@ -1202,6 +1208,36 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
 	auto vk_buffer = buffer.Handle();
+	bool isolate   = false;
+	if (GpuWorkLog::TraceEnabled()) {
+		GpuWorkLog::Work work;
+		work.kind         = emulated_mesh ? 'M' : 'D';
+		work.shaders[0]   = vs_hash;
+		work.shaders[1]   = ps_hash;
+		work.pipeline     = reinterpret_cast<uint64_t>(static_cast<VkPipeline>(pipeline.pipeline));
+		work.instances    = emit.indirect.address != 0 ? emit.indirect.count : draw.instance_count;
+		work.elements     = host_draw.index_count;
+		work.width        = rendering.width;
+		work.height       = rendering.height;
+		work.color_count  = rendering.num_color_attachments;
+		work.tessellation = state.ps_active &&
+		                    !state.ps_input_info.stage.module->triangle_parameters.empty();
+		if (emulated_mesh) {
+			const auto chunks = (mesh_groups - 1u) / emulated_group_limit + 1u;
+			work.host_passes  = uint64_t {draw.instance_count} * chunks;
+			work.elements     = uint64_t {std::min(mesh_groups, emulated_group_limit)} *
+			                    mesh.max_primitives * 3u;
+		}
+		isolate = GpuWorkLog::Record(m_context.GetCommandScheduler().CurrentTick(), work);
+	}
+	// Isolation mode: the GPU finishes this operation before more work is recorded.
+	const auto isolate_wait = [&] {
+		if (isolate) {
+			buffer.EndRendering();
+			auto& scheduler = m_context.GetCommandScheduler();
+			scheduler.Wait(scheduler.CurrentTick());
+		}
+	};
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
@@ -1292,6 +1328,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		}
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
+		isolate_wait();
 		return;
 	}
 	buffer.BeginRendering(rendering);
@@ -1319,6 +1356,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		buffer.EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
+	isolate_wait();
 }
 
 // Vulkan offsets for a prepared draw, or nullopt when its indirect records need the CPU:

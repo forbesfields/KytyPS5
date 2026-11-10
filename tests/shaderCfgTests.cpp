@@ -1997,7 +1997,93 @@ void TestUnsignedLaunchRanges() {
   }
 }
 
-#if defined(__APPLE__)
+bool SpirvHasConstantWord(const std::vector<uint32_t> &binary, uint32_t value) {
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t word_count = binary[i] >> 16u;
+    if (word_count == 0 || i + word_count > binary.size()) {
+      return false;
+    }
+    // OpConstant: result type, result id, value.
+    if ((binary[i] & 0xffffu) == 43u && word_count == 4u && binary[i + 3] == value) {
+      return true;
+    }
+    i += word_count;
+  }
+  return false;
+}
+
+// SPIR-V 1.3 GroupNonUniform* opcodes, from OpGroupNonUniformElect to
+// OpGroupNonUniformQuadSwap.
+bool SpirvUsesSubgroupInstructions(const std::vector<uint32_t> &binary) {
+  for (uint32_t opcode = 333u; opcode <= 366u; ++opcode) {
+    if (SpirvContainsOpcode(binary, opcode)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// MoltenVK has no vertex-stage subgroups; the emulator then compiles vertex
+// shaders as one-lane waves.
+constexpr ShaderRecompiler::Spirv::Profile kNoVertexSubgroups{
+    .vertex_subgroups = false, .tessellation_evaluation_subgroups = false};
+
+void CheckOneLaneWave(const std::vector<uint32_t> &spirv, const char *message) {
+  constexpr uint32_t kBuiltIn = 11u;
+  constexpr uint32_t kSubgroupLocalInvocationId = 41u;
+  constexpr uint32_t kGroupNonUniform = 61u;
+  Check(!SpirvUsesSubgroupInstructions(spirv) &&
+            !SpirvContainsCapability(spirv, kGroupNonUniform) &&
+            !SpirvHasDecorationValue(spirv, kBuiltIn, kSubgroupLocalInvocationId),
+        message);
+  CheckSpirvBinaryValidates(spirv);
+}
+
+void TestSingleLaneVertexWaves() {
+  using namespace ShaderRecompiler;
+  ShaderVertexInputInfo vertex{};
+  for (const uint32_t wave_size : {32u, 64u}) {
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.wave_size = wave_size;
+    options.input_info.vertex = &vertex;
+    options.profile = &kNoVertexSubgroups;
+
+    // Export the NGG wave info SGPR (s3) as the position. A one-lane wave
+    // launches one vertex: s3 holds the count 1 and the wave ID bit 28. A count
+    // equal to the wave size enables lanes that the host does not have, and a
+    // guest loop that waits for them to finish does not end.
+    const uint32_t wave_info[] = {
+        EncodeVop1(0x01, 0, 3), // v_mov_b32 v0, s3
+        EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
+    };
+    const auto info = RecompileForTest(wave_info, options);
+    Check(SpirvHasConstantWord(info.spirv, (1u << 28u) | 1u) &&
+              !SpirvHasConstantWord(info.spirv, (1u << 28u) | wave_size),
+          "a one-lane vertex wave did not report one launched lane");
+    CheckOneLaneWave(info.spirv, "a one-lane vertex wave used host subgroup operations");
+
+    // V_READFIRSTLANE needs a ballot and a shuffle. In a one-lane wave both
+    // read this invocation's own values.
+    const uint32_t first_lane[] = {
+        EncodeVop1(0x02, 0, 256u + 5u), // v_readfirstlane_b32 s0, v5
+        EncodeVop1(0x01, 0, 0),         // v_mov_b32 v0, s0
+        EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
+    };
+    const auto first = RecompileForTest(first_lane, options);
+    Check(first.program.info.subgroup_ballot && first.program.info.subgroup_shuffle,
+          "V_READFIRSTLANE no longer reads a lane; the test does not check the one-lane path");
+    CheckOneLaneWave(first.spirv, "V_READFIRSTLANE used host subgroup operations");
+
+    // A host with vertex subgroups keeps the counted launch mask.
+    auto native = options;
+    native.profile = &Spirv::DefaultProfile;
+    const auto counted = RecompileForTest(wave_info, native);
+    Check(!SpirvHasConstantWord(counted.spirv, (1u << 28u) | 1u) &&
+              SpirvContainsCapability(counted.spirv, 61u),
+          "a host with vertex subgroups lost the counted launch mask");
+  }
+}
+
 void TestMetalVertexLaunchMask() {
   using namespace ShaderRecompiler;
   // Extract the NGG vertex count and enable that many lanes before exporting the vertex ID.
@@ -2025,7 +2111,11 @@ void TestMetalVertexLaunchMask() {
       auto options = MakeCompileOptions(ShaderType::Vertex);
       options.wave_size = wave_size;
       options.input_info.vertex = &vertex;
+      options.profile = &kNoVertexSubgroups;
       const auto result = RecompileForTest(shader, options);
+      // The launch mask can keep a lane predicate (lane < 1). The one-lane wave
+      // emits its lane ID as 0, so the SPIR-V has no subgroup built-in.
+      CheckOneLaneWave(result.spirv, "an NGG launch mask used host subgroup operations");
       if (shader.data() == mbcnt_code && wave_size == 64u) {
         // This captured wave32 program writes only EXEC_LO. Running the same words
         // as wave64 leaves the upper half inactive and must retain a lane predicate.
@@ -2034,9 +2124,6 @@ void TestMetalVertexLaunchMask() {
         CheckSpirvBinaryValidates(result.spirv);
         continue;
       }
-      Check(!result.program.info.subgroup_ballot &&
-                !result.program.info.subgroup_local_invocation_id,
-            "NGG launch mask needs unsupported Metal vertex subgroup builtins");
       Check(std::ranges::any_of(result.program.info.outputs, [](const auto& output) {
               return output.kind == IR::StageOutputKind::Position;
             }), "NGG launch mask discarded the vertex position");
@@ -2044,7 +2131,6 @@ void TestMetalVertexLaunchMask() {
     }
   }
 }
-#endif
 
 void TestNativeDataCacheInvalidation() {
   using namespace ShaderRecompiler;
@@ -13653,15 +13739,14 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
-#if defined(__APPLE__)
   if (argc == 2 && std::strcmp(argv[1], "--vertex-launch-only") == 0) {
     TestUnsignedLaunchRanges();
     TestNggVertexEntryState();
+    TestSingleLaneVertexWaves();
     TestMetalVertexLaunchMask();
     std::puts("ShaderCfgTests: Metal vertex launch masks passed");
     return 0;
   }
-#endif
   if (argc == 2 && std::strcmp(argv[1], "--texture-mip-view-only") == 0) {
     TestExtendedTextureMipViews();
     TestRebasedTextureMipViews();
@@ -13709,9 +13794,8 @@ int main(int argc, char **argv) {
   TestShaderProgramHash();
   TestNggVertexEntryState();
   TestUnsignedLaunchRanges();
-#if defined(__APPLE__)
+  TestSingleLaneVertexWaves();
   TestMetalVertexLaunchMask();
-#endif
   TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerAuxPositionExports();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();

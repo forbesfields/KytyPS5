@@ -125,7 +125,11 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 
 // Whether EXEC enables a source lane within the caller's 32-lane half.
 uint32_t EmitSourceLaneActive(ValueEmitContext& ctx, uint32_t exec, uint32_t lane) {
-	auto&      state  = ctx.state;
+	auto& state = ctx.state;
+	if (state.single_lane) {
+		return Binary(state, spv::OpLogicalAnd, TypeBool(state), exec,
+		              Binary(state, spv::OpIEqual, TypeBool(state), lane, ConstantU32(state, 0)));
+	}
 	const auto scope  = ConstantU32(state, spv::ScopeSubgroup);
 	const auto ballot = EmitNative<spv::OpGroupNonUniformBallot, IR::Type::U32x4>(state, scope, exec);
 	if (ctx.half != 0) {
@@ -704,6 +708,15 @@ uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
 void EmitVoid(ValueEmitContext&) {}
 
 void EmitStoreCompletion(EmitterState& state) {
+	if (state.single_lane) {
+		// No other lane to wait for: only make the stores visible.
+		state.builder.AddFunction(
+		    spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
+		    ConstantU32(state, spv::MemorySemanticsReleaseMask |
+		                          spv::MemorySemanticsUniformMemoryMask |
+		                          spv::MemorySemanticsImageMemoryMask));
+		return;
+	}
 	state.builder.AddFunction(
 	    spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup),
 	    ConstantU32(state, spv::ScopeDevice),
@@ -833,6 +846,9 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
 		                   TypeBool(ctx.state), predicate, ctx.HalfArg(inst, 0, 1));
 	}
+	if (ctx.state.single_lane) {
+		return predicate;
+	}
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
 	                              TypeBool(ctx.state), result,
@@ -867,6 +883,9 @@ static uint32_t EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& ins
 	auto value = ctx.Arg(inst, 0);
 	if (ctx.other_half != nullptr) {
 		value = Combine(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
+	}
+	if (state.single_lane) {
+		return value;
 	}
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(Reduce, TypeU32(state), result,

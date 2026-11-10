@@ -103,6 +103,9 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 }
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+	if (state.single_lane) {
+		return ConstantU32(state, 0);
+	}
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}
@@ -186,10 +189,34 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 }
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
-	const auto active_ballot = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
-	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
-	return EmitBallotLaneActiveBool(state, active_ballot, lane);
+	return EmitBallotLaneActiveBool(state, EmitSubgroupBallot(state, ConstantBool(state, true)),
+	                                lane);
+}
+
+uint32_t EmitSubgroupBallot(EmitterState& state, uint32_t predicate) {
+	const auto ballot = state.builder.AllocateId();
+	if (state.single_lane) {
+		const auto zero = ConstantU32(state, 0);
+		const auto bit  = Select(state, TypeU32(state), predicate, ConstantU32(state, 1), zero);
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), ballot, bit,
+		                          zero, zero, zero);
+		return ballot;
+	}
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+	                          ConstantU32(state, spv::ScopeSubgroup), predicate);
+	return ballot;
+}
+
+uint32_t EmitSubgroupShuffle(EmitterState& state, uint32_t type, uint32_t value, uint32_t lane) {
+	// A one-lane wave has no other lane to read. Callers that need an absent source lane to read
+	// as zero check the lane with EmitSubgroupLaneActiveBool.
+	if (state.single_lane) {
+		return value;
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, result,
+	                          ConstantU32(state, spv::ScopeSubgroup), value, lane);
+	return result;
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {
 	const auto low = state.builder.AllocateId();
