@@ -90,7 +90,7 @@ private:
 	OcclusionQueries          m_occlusion_queries;
 	std::optional<uint64_t>    m_unified_cache_limit;
 	uint64_t                   m_budget_log_frame = 0;
-	uint64_t                   m_next_pool_reclaim_frame = 0;
+	std::chrono::steady_clock::time_point m_last_pool_reclaim {};
 	bool                       m_reclaim_metal_pool = false;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;

@@ -185,15 +185,15 @@ void RenderContext::RunGarbageCollector() {
 		auto usage = m_graphics.GetUnifiedMemoryUsage();
 		GpuCacheBudget budget {usage.driver_bytes, *m_unified_cache_limit,
 		                       GraphicContext::GetHostCachePressure()};
-		if (m_reclaim_metal_pool && frame >= m_next_pool_reclaim_frame &&
-		    budget.ShouldReclaimDriverPool(usage.allocator_block_bytes)) {
+		if (m_reclaim_metal_pool && budget.ShouldReclaimDriverPool(
+		        usage.allocator_block_bytes, std::chrono::steady_clock::now() - m_last_pool_reclaim)) {
 			const auto before = usage;
 			m_command_scheduler.RecreateCommandPool();
 			usage = m_graphics.GetUnifiedMemoryUsage();
 			budget.used = usage.driver_bytes;
 			budget.host_level = GraphicContext::GetHostCachePressure();
-			// Bound the frequency of queue drains when a scene keeps rebuilding scratch buffers.
-			m_next_pool_reclaim_frame = frame + 120;
+			// Measure the cooldown in wall time so slow frames do not delay critical reclaim.
+			m_last_pool_reclaim = std::chrono::steady_clock::now();
 			LOGF("Metal command pool reclaimed: driver=%" PRIu64 " -> %" PRIu64
 			     " MiB, VMA blocks=%" PRIu64 " -> %" PRIu64 " MiB\n",
 			     before.driver_bytes / MiB, usage.driver_bytes / MiB,

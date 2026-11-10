@@ -45,16 +45,23 @@ int main() {
 	Check(critical.Level(5 * GiB) == CacheReclaimLevel::Critical,
 	      "macOS critical pressure triggers critical reclaim below the limit");
 
+	using namespace std::chrono_literals;
 	// In the title-scene capture, the caches freed Vulkan blocks while Metal usage grew.
 	const GpuCacheBudget scratch_pressure {10327 * MiB, limit, CacheReclaimLevel::Pressure};
-	Check(scratch_pressure.ShouldReclaimDriverPool(3000 * MiB),
-	      "reclaim a Metal scratch pool when driver use greatly exceeds VMA blocks");
-	Check(!scratch_pressure.ShouldReclaimDriverPool(10000 * MiB),
+	Check(scratch_pressure.ShouldReclaimDriverPool(3000 * MiB, 1s),
+	      "a critical Metal spike can trigger another queue drain after one second");
+	Check(!scratch_pressure.ShouldReclaimDriverPool(3000 * MiB, 999ms),
+	      "critical pressure still limits the rate of queue drains");
+	Check(!scratch_pressure.ShouldReclaimDriverPool(10000 * MiB, 10s),
 	      "cache-owned memory pressure should not drain the GPU queue");
+	const GpuCacheBudget warning_driver {7 * GiB, limit, CacheReclaimLevel::Pressure};
+	Check(!warning_driver.ShouldReclaimDriverPool(3 * GiB, 4999ms) &&
+	      warning_driver.ShouldReclaimDriverPool(3 * GiB, 5s),
+	      "warning pressure permits one drain every five seconds");
 	const GpuCacheBudget idle_driver {5 * GiB, limit, CacheReclaimLevel::Idle};
-	Check(!idle_driver.ShouldReclaimDriverPool(3 * GiB), "do not drain an idle renderer");
+	Check(!idle_driver.ShouldReclaimDriverPool(3 * GiB, 10s), "do not drain an idle renderer");
 	const GpuCacheBudget stale_usage {6 * GiB, limit, CacheReclaimLevel::Pressure};
-	Check(!stale_usage.ShouldReclaimDriverPool(7 * GiB),
+	Check(!stale_usage.ShouldReclaimDriverPool(7 * GiB, 10s),
 	      "a stale driver sample must not wrap the untracked byte count");
 
 	Common::LeastRecentlyUsedCache<int, uint64_t> textures;
