@@ -22,6 +22,11 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_unified_cache_limit(graphics.GetUnifiedCacheLimit()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	if (m_unified_cache_limit) {
+		vk::PhysicalDeviceDriverProperties driver {};
+		vk::PhysicalDeviceProperties2 properties {};
+		properties.pNext = &driver;
+		graphics.physical_device.getProperties2(&properties);
+		m_reclaim_metal_pool = driver.driverID == vk::DriverId::eMoltenvk;
 		Log::WriteToConsoleAndLog(fmt::format("Unified GPU cache budget: {} MiB\n",
 		                                      *m_unified_cache_limit / (1024 * 1024)));
 	}
@@ -175,9 +180,26 @@ void RenderContext::RunGarbageCollector() {
 	m_image_heap.RunGarbageCollector();
 	m_texture_cache.ProcessDownloadImages();
 	if (m_unified_cache_limit) {
-		const GpuCacheBudget budget {m_graphics.GetDeviceMemoryUsage(), *m_unified_cache_limit,
-		                             GraphicContext::GetHostCachePressure()};
-		if (m_budget_log_frame++ % 120 == 0) {
+		constexpr uint64_t MiB = 1024 * 1024;
+		const auto frame = m_budget_log_frame++;
+		auto usage = m_graphics.GetUnifiedMemoryUsage();
+		GpuCacheBudget budget {usage.driver_bytes, *m_unified_cache_limit,
+		                       GraphicContext::GetHostCachePressure()};
+		if (m_reclaim_metal_pool && frame >= m_next_pool_reclaim_frame &&
+		    budget.ShouldReclaimDriverPool(usage.allocator_block_bytes)) {
+			const auto before = usage;
+			m_command_scheduler.RecreateCommandPool();
+			usage = m_graphics.GetUnifiedMemoryUsage();
+			budget.used = usage.driver_bytes;
+			budget.host_level = GraphicContext::GetHostCachePressure();
+			// Bound the frequency of queue drains when a scene keeps rebuilding scratch buffers.
+			m_next_pool_reclaim_frame = frame + 120;
+			LOGF("Metal command pool reclaimed: driver=%" PRIu64 " -> %" PRIu64
+			     " MiB, VMA blocks=%" PRIu64 " -> %" PRIu64 " MiB\n",
+			     before.driver_bytes / MiB, usage.driver_bytes / MiB,
+			     before.allocator_block_bytes / MiB, usage.allocator_block_bytes / MiB);
+		}
+		if (frame % 120 == 0) {
 			using Common::DebugCounters::Counter;
 			using Common::DebugCounters::Get;
 			LOGF("Unified GPU cache: used=%" PRIu64 " MiB limit=%" PRIu64

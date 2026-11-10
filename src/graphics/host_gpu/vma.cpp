@@ -152,6 +152,21 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
+GraphicContext::UnifiedMemoryUsage GraphicContext::GetUnifiedMemoryUsage() const {
+	vk::PhysicalDeviceMemoryBudgetPropertiesEXT driver {};
+	vk::PhysicalDeviceMemoryProperties2 properties {};
+	properties.pNext = &driver;
+	physical_device.getMemoryProperties2(&properties);
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	UnifiedMemoryUsage usage {};
+	for (uint32_t heap = 0; heap < properties.memoryProperties.memoryHeapCount; ++heap) {
+		usage.driver_bytes += driver.heapUsage[heap];
+		usage.allocator_block_bytes += budgets[heap].statistics.blockBytes;
+	}
+	return usage;
+}
+
 std::optional<uint64_t> GraphicContext::GetUnifiedCacheLimit() const {
 #if defined(__APPLE__)
 	if (!CanReportMemoryUsage() ||

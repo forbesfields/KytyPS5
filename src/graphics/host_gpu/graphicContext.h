@@ -113,6 +113,11 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	struct UnifiedMemoryUsage {
+		uint64_t driver_bytes;
+		uint64_t allocator_block_bytes;
+	};
+	[[nodiscard]] UnifiedMemoryUsage GetUnifiedMemoryUsage() const;
 	[[nodiscard]] std::optional<uint64_t> GetUnifiedCacheLimit() const;
 	[[nodiscard]] static CacheReclaimLevel GetHostCachePressure();
 

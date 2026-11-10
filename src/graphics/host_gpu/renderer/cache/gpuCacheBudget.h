@@ -32,6 +32,12 @@ struct GpuCacheBudget {
 		                                               : CacheReclaimLevel::Idle;
 		return std::max(level, host_level);
 	}
+
+	[[nodiscard]] constexpr bool ShouldReclaimDriverPool(uint64_t allocator_blocks) const {
+		constexpr uint64_t min_driver_overhead = 1024ull * 1024 * 1024;
+		return Level(used) >= CacheReclaimLevel::Pressure &&
+		       SubtractBytes(used, allocator_blocks) >= min_driver_overhead;
+	}
 };
 
 [[nodiscard]] constexpr uint64_t TextureReclaimAge(CacheReclaimLevel level) {

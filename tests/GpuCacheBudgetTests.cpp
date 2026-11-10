@@ -45,6 +45,18 @@ int main() {
 	Check(critical.Level(5 * GiB) == CacheReclaimLevel::Critical,
 	      "macOS critical pressure triggers critical reclaim below the limit");
 
+	// In the title-scene capture, the caches freed Vulkan blocks while Metal usage grew.
+	const GpuCacheBudget scratch_pressure {10327 * MiB, limit, CacheReclaimLevel::Pressure};
+	Check(scratch_pressure.ShouldReclaimDriverPool(3000 * MiB),
+	      "reclaim a Metal scratch pool when driver use greatly exceeds VMA blocks");
+	Check(!scratch_pressure.ShouldReclaimDriverPool(10000 * MiB),
+	      "cache-owned memory pressure should not drain the GPU queue");
+	const GpuCacheBudget idle_driver {5 * GiB, limit, CacheReclaimLevel::Idle};
+	Check(!idle_driver.ShouldReclaimDriverPool(3 * GiB), "do not drain an idle renderer");
+	const GpuCacheBudget stale_usage {6 * GiB, limit, CacheReclaimLevel::Pressure};
+	Check(!stale_usage.ShouldReclaimDriverPool(7 * GiB),
+	      "a stale driver sample must not wrap the untracked byte count");
+
 	Common::LeastRecentlyUsedCache<int, uint64_t> textures;
 	(void)textures.Insert(1, 12);
 	(void)textures.Insert(2, 30);
