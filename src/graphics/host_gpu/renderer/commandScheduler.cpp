@@ -23,11 +23,11 @@ std::atomic<uint64_t> g_gpu_thread_wait_ns {0};
 
 bool FewerSubmitsEnabled() {
 	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_PERF_FEWER_SUBMITS");
-		const bool enabled = value == nullptr || std::strcmp(value, "0") != 0;
-		Log::WriteToConsoleAndLog(enabled ? "KYTY_PERF_FEWER_SUBMITS=1 (default on)\n"
-		                                 : "KYTY_PERF_FEWER_SUBMITS=0 (legacy slice flushes)\n");
-		return enabled;
+		const auto* value  = std::getenv("KYTY_PERF_FEWER_SUBMITS");
+		const bool active = value == nullptr || std::strcmp(value, "0") != 0;
+		Log::WriteToConsoleAndLog(active ? "KYTY_PERF_FEWER_SUBMITS=1 (default on)\n"
+		                                : "KYTY_PERF_FEWER_SUBMITS=0 (legacy slice flushes)\n");
+		return active;
 	}();
 	return enabled;
 }

@@ -23,10 +23,23 @@ void CheckFewerSubmits() {
     processor.BufferInit();
     Buffer output(window.graphic_ctx, scheduler, MemoryUsage::Download, 0,
                   vk::BufferUsageFlagBits::eTransferDst, slices * sizeof(uint32_t));
+    const auto fill = [&](uint64_t offset, uint32_t value) {
+      const auto command = scheduler.Current().Handle();
+      command.fillBuffer(output.Handle(), offset, sizeof(uint32_t), value);
+      vk::BufferMemoryBarrier host_read{};
+      host_read.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      host_read.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      host_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      host_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      host_read.buffer = output.Handle();
+      host_read.offset = offset;
+      host_read.size = sizeof(uint32_t);
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+                              {}, 0, nullptr, 1, &host_read, 0, nullptr);
+    };
     const auto first_tick = scheduler.CurrentTick();
     for (uint32_t i = 0; i < slices; ++i) {
-      scheduler.Current().Handle().fillBuffer(output.Handle(), i * sizeof(uint32_t),
-                                              sizeof(uint32_t), 0x100u + i);
+      fill(i * sizeof(uint32_t), 0x100u + i);
       processor.BufferFlush(i + 1 < slices);
     }
     const auto submits = scheduler.CurrentTick() - first_tick;
@@ -55,7 +68,7 @@ void CheckFewerSubmits() {
 
     // A CPU readback of the current recording submits it before the timeline wait.
     const auto readback_tick = scheduler.CurrentTick();
-    scheduler.Current().Handle().fillBuffer(output.Handle(), 0, sizeof(uint32_t), 0xabcdef01u);
+    fill(0, 0xabcdef01u);
     processor.BufferFlush(true);
     scheduler.Wait(readback_tick);
     Require(name, "readback submit", scheduler.CurrentTick() == readback_tick + 1 &&

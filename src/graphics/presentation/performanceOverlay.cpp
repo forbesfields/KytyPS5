@@ -389,7 +389,7 @@ void GpuActivityRows(const Snapshot& shown) {
 	                                   shown.frame_count,
 	                               submits)
 	                         : Fmt("n/a per frame  %.0f/s", submits));
-	Row("GPU thread waiting on GPU",
+	Row("GPU thread scheduler waits",
 	    Fmt("%.0f ms/s  (%.0f waits/s)", shown.rates[GPU_THREAD_WAIT_NS] / 1e6,
 	        shown.rates[GPU_THREAD_WAITS]));
 	// Includes the background completion runner and present pacing waits.

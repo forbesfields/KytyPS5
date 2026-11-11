@@ -55396,7 +55396,7 @@ void CheckPm4Flip() {
     for (const auto counter : results) {
       published &= (counter & OCCLUSION_QUERY_READY) != 0;
     }
-    processor.BufferFlush();
+    // The flip must submit its prepared frame now. No end-of-slice flush follows this call.
   });
 
   // A present stalled on the graphics queue leaves the port readable.
