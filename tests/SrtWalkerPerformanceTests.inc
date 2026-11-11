@@ -118,6 +118,8 @@ void TestDrawResourceWalkRefresh() {
   }
 
   Program source;
+  source.srt_plan_complete = true;
+  source.resource_tracking_complete = true;
   source.user_data_count = 1;
   auto &block = AddValueBlock(source);
   const auto emit = [&](ValueOpcode op, std::initializer_list<Value> args) {
@@ -153,6 +155,8 @@ void TestSharedOperandRefresh() {
   // Different graph sizes exercise short clears and the large-clear fallback.
   for (uint32_t depth = 0; depth < 270u; ++depth) {
     Program program;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
     program.user_data_count = 1;
     auto &block = AddValueBlock(program);
     auto value = Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(0))}));
