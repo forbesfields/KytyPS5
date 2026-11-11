@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 
 namespace Libs::Graphics {
@@ -45,19 +46,47 @@ struct GpuCacheBudget {
 	}
 };
 
+enum class CommandPoolRetirementAction { Pending, Release, Wait };
+
+// A GPU timeline signal can precede MoltenVK's host completion handlers. A fence
+// checkpoint is also required before those handlers' allocation pools can be freed.
+struct CommandPoolRetirementBudget {
+	static constexpr size_t   MaxPendingPools = 2;
+	static constexpr uint64_t MaxPendingFrames = 2;
+
+	[[nodiscard]] static constexpr CommandPoolRetirementAction Poll(
+	    uint64_t last_tick, uint64_t completed_tick, bool fence_complete,
+	    size_t pending_pools, uint64_t pending_frames) {
+		if (last_tick <= completed_tick && fence_complete) {
+			return CommandPoolRetirementAction::Release;
+		}
+		if (pending_pools >= MaxPendingPools || pending_frames >= MaxPendingFrames) {
+			return CommandPoolRetirementAction::Wait;
+		}
+		return CommandPoolRetirementAction::Pending;
+	}
+};
+
 // Bound the work retained by one MoltenVK pool without waiting at every small draw.
 // This is a soft work limit, not a byte cap: one guest draw can exceed it. GPU-only
 // indirect counts are retired at the frame boundary instead of forcing a reset per draw.
 struct TessellationBatchBudget {
 	static constexpr uint64_t MaxVertices = 512 * 1024;
+	// Three live ring pools retain less total work than one legacy pool, before
+	// per-draw overshoot and the driver's allocation rounding.
+	static constexpr uint64_t MaxRingVertices = 128 * 1024;
 
 	void Record(uint32_t vertices, uint32_t instances) {
 		m_vertices += std::min(MaxVertices, uint64_t {vertices} * instances);
 		m_vertices = std::min(m_vertices, MaxVertices);
 	}
 	void RecordIndirect() { m_indirect = true; }
-	[[nodiscard]] bool NeedsReclaim() const { return m_vertices >= MaxVertices; }
-	[[nodiscard]] bool NeedsFrameReclaim() const { return m_indirect || NeedsReclaim(); }
+	[[nodiscard]] bool NeedsReclaim(bool use_ring = false) const {
+		return m_vertices >= (use_ring ? MaxRingVertices : MaxVertices);
+	}
+	[[nodiscard]] bool NeedsFrameReclaim(bool bound_lifetime = false) const {
+		return m_indirect || NeedsReclaim() || (bound_lifetime && m_vertices != 0);
+	}
 	void Reset() {
 		m_vertices = 0;
 		m_indirect = false;
