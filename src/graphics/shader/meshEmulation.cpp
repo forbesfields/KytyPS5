@@ -198,7 +198,12 @@ public:
                 corner_indices[c] = Read(Binary(spv::OpIAdd, Uint(VertexStoreHeaderDwords + c),
                                                 Binary(spv::OpIMul, triangle, Uint(3u))));
         } else {
-            const auto group = Binary(spv::OpUDiv, triangle, Uint(layout.max_primitives));
+            const auto instance = Result(spv::OpBitcast, uint_type,
+                                         Result(spv::OpLoad, int_type, instance_index));
+            // Positions and raw corner addresses share this instance-adjusted record base.
+            const auto group = Binary(spv::OpIAdd,
+                Binary(spv::OpUDiv, triangle, Uint(layout.max_primitives)),
+                Binary(spv::OpIMul, instance, Read(Uint(2u))));
             const auto primitive = Binary(spv::OpUMod, triangle, Uint(layout.max_primitives));
             const auto base = Binary(spv::OpIAdd, Uint(MeshEmulationLayout::HeaderDwords),
                                       Binary(spv::OpIMul, group, Uint(layout.GroupDwords())));

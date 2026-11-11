@@ -13786,6 +13786,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 #include "ShaderRayTracingTests.inc"
 #include "MeshEmulationGpuTests.inc"
 #include "PerVertexVsStoreTests.inc"
+#include "MeshBatchCornerGpuTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
@@ -13816,9 +13817,14 @@ int main(int argc, char **argv) {
     TestPerVertexBufferGpu();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--mesh-batch-corners-only") == 0) {
+    TestMeshBatchCornersGpu();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--mesh-gpu-only") == 0) {
     TestMeshEmulationGpu();
     TestPerVertexBufferGpu();
+    TestMeshBatchCornersGpu();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--portable-interpolation-only") == 0) {
