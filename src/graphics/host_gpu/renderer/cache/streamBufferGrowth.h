@@ -6,10 +6,11 @@
 
 namespace Libs::Graphics {
 
-inline constexpr uint64_t UploadRingMaximumSize = 512ull * 1024 * 1024;
+// Even with both retired rings alive, 64 + 128 + 256 MiB stays below the old 512 MiB ring.
+inline constexpr uint64_t UploadRingMaximumSize = 256ull * 1024 * 1024;
 
 [[nodiscard]] constexpr uint64_t UploadRingInitialSize(bool adaptive) {
-	return adaptive ? 64ull * 1024 * 1024 : UploadRingMaximumSize;
+	return (adaptive ? 64ull : 512ull) * 1024 * 1024;
 }
 
 // A failed allocation leaves the caller's current ring intact.

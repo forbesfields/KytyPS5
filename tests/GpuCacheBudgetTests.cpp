@@ -28,9 +28,14 @@ int main() {
   using Libs::Graphics::TryGrowUploadRing;
   Check(Libs::Graphics::UploadRingInitialSize(false) == 512 * MiB &&
             Libs::Graphics::UploadRingInitialSize(true) == 64 * MiB &&
-            Libs::Graphics::UploadRingMaximumSize == 512 * MiB,
+            Libs::Graphics::UploadRingMaximumSize == 256 * MiB,
         "adaptive startup must save 448 MiB and the kill switch must restore 512 MiB");
   std::puts("Upload ring startup allocation: 512 -> 64 MiB; saving 448 MiB");
+  Check(Libs::Graphics::UploadRingMaximumSize +
+            Libs::Graphics::UploadRingMaximumSize / 2 +
+            Libs::Graphics::UploadRingInitialSize(true) == 448 * MiB,
+        "queued growth allocations must remain below the old fixed ring size");
+  std::puts("Upload ring cap: 256 MiB; saving at least 256 MiB of fixed storage");
   uint64_t capacity = 64 * MiB;
   unsigned allocations = 0;
   const auto allocate = [&](uint64_t size) {
@@ -38,16 +43,16 @@ int main() {
     capacity = size;
     return true;
   };
-  Check(!TryGrowUploadRing(capacity, capacity, 512 * MiB, allocate) &&
+  Check(!TryGrowUploadRing(capacity, capacity, 256 * MiB, allocate) &&
             allocations == 0,
         "an exact fit must not grow the upload ring");
-  Check(TryGrowUploadRing(capacity, capacity + 1, 512 * MiB, allocate) &&
+  Check(TryGrowUploadRing(capacity, capacity + 1, 256 * MiB, allocate) &&
             capacity == 128 * MiB && allocations == 1,
         "one byte beyond the ring must double its capacity");
-  Check(TryGrowUploadRing(capacity, 300 * MiB, 512 * MiB, allocate) &&
-            capacity == 512 * MiB && allocations == 2,
+  Check(TryGrowUploadRing(capacity, 200 * MiB, 256 * MiB, allocate) &&
+            capacity == 256 * MiB && allocations == 2,
         "a large upload must grow directly to a fitting capacity");
-  Check(!TryGrowUploadRing(capacity, capacity + 1, 512 * MiB, allocate) &&
+  Check(!TryGrowUploadRing(capacity, capacity + 1, 256 * MiB, allocate) &&
             allocations == 2,
         "uploads above the cap must use the temporary-buffer fallback");
   capacity = 64 * MiB;
@@ -56,7 +61,7 @@ int main() {
     Check(size == 128 * MiB, "failed growth must request the next size");
     return false;
   };
-  Check(!TryGrowUploadRing(capacity, capacity + 1, 512 * MiB, fail_allocate) &&
+  Check(!TryGrowUploadRing(capacity, capacity + 1, 256 * MiB, fail_allocate) &&
             capacity == 64 * MiB && allocations == 3,
         "failed growth must preserve capacity for ring reuse or "
         "temporary-buffer fallback");
