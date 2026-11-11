@@ -778,6 +778,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --texture-mip-view-only)
 	add_test(NAME shader_mesh_emulation
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --mesh-emulation-only)
+	add_test(NAME shader_per_vertex_vs_store
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --vs-store-only)
 	add_test(NAME shader_portable_interpolation
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --portable-interpolation-only)
 	if(APPLE)

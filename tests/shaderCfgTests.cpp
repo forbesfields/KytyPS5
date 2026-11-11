@@ -30,6 +30,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/meshEmulation.h"
 #include "graphics/shader/triangleShader.h"
+#include "graphics/host_gpu/renderer/perVertexVsStore.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "libs/agc.h"
 #include "spirv-tools/libspirv.hpp"
@@ -13784,6 +13785,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 
 #include "ShaderRayTracingTests.inc"
 #include "MeshEmulationGpuTests.inc"
+#include "PerVertexVsStoreTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
@@ -13806,8 +13808,17 @@ int main(int argc, char **argv) {
     std::puts("ShaderCfgTests: texture mip views passed");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--vs-store-only") == 0) {
+    TestPerVertexBufferEmission();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--vs-store-gpu-only") == 0) {
+    TestPerVertexBufferGpu();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--mesh-gpu-only") == 0) {
     TestMeshEmulationGpu();
+    TestPerVertexBufferGpu();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--portable-interpolation-only") == 0) {
