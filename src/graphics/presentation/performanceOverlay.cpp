@@ -375,6 +375,16 @@ void TransferRow(const Snapshot& shown, const char* label, Counter upload, Count
 void GpuActivityRows(const Snapshot& shown) {
 	const auto draws = Rate(shown, Counter::Draws);
 	Row("Draw calls", Fmt("%.0f/frame  %.0f/s", draws / std::max(shown.fps, 1.0), draws));
+	const auto per_frame = [&](Counter counter) {
+		return Rate(shown, counter) / std::max(shown.fps, 1.0);
+	};
+	Row("Render / compute / buffer blit",
+	    Fmt("%.0f / %.0f / %.0f per frame", per_frame(Counter::RenderPassStarts),
+	        per_frame(Counter::ComputePasses), per_frame(Counter::BufferBlits)));
+	Row("Pass merges / in-pass clears",
+	    Fmt("%.0f / %.0f per frame", per_frame(Counter::RenderPassMerges),
+	        per_frame(Counter::InPassClears)));
+	Row("Attachment stores skipped", Fmt("%.0f/frame", per_frame(Counter::AttachmentStoresSkipped)));
 	// Includes present pacing waits, so a high value alone is not a stall.
 	Row("CPU waiting on GPU",
 	    Fmt("%.0f ms/s  (%.0f waits/s)", Rate(shown, Counter::GpuWaitNs) / 1e6,

@@ -482,11 +482,13 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 						ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 					}
 					vk_buffer.dispatchBase(x, y, z, 1, 1, 1);
+					Common::DebugCounters::Add(Common::DebugCounters::Counter::ComputePasses);
 				}
 			}
 		}
 	} else {
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::ComputePasses);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
@@ -559,6 +561,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::ComputePasses);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
