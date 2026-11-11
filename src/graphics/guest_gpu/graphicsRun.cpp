@@ -486,6 +486,13 @@ void GuestGpu::ThreadRun(void* data) {
 
 bool GuestGpu::Process(Submission& submission) {
 	auto& cp = GetProcessor(submission.queue_id);
+	auto& scheduler = m_renderer.GetCommandScheduler();
+	// Another queue can become ready after the previous slice checks its successor.
+	if (scheduler.HasDeferredSlices() &&
+	    (&scheduler.Current().GetRegisters() != &cp.GetCtx() ||
+	     submission.type != SubmissionType::Commands)) {
+		scheduler.Flush();
+	}
 
 	cp.BufferInit();
 	bool complete = true;
@@ -494,8 +501,7 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::Commands:
 			complete =
 			    cp.Process(submission.execution, submission.commands) == Pm4ProcessResult::Complete;
-			if (submission.execution.MadeProgress() ||
-			    m_renderer.GetCommandScheduler().HasDeferredSlices()) {
+			if (submission.execution.MadeProgress() || scheduler.HasDeferredSlices()) {
 				bool next_slice_ready = false;
 				if (complete) {
 					Common::LockGuard lock(m_queue_mutex);

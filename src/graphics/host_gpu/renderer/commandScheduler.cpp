@@ -185,10 +185,15 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 void CommandScheduler::FlushSlice(bool next_slice_ready) {
 	// Bound each batch to four slices so a long queue still starts GPU work early. Flips,
 	// readbacks, waits and explicit Flush calls submit at their original boundaries.
-	if (FewerSubmitsEnabled() && next_slice_ready && m_deferred_slices < 3 &&
-	    !HasPendingPriorityOperations()) {
-		m_deferred_slices++;
-		return;
+	if (FewerSubmitsEnabled() && next_slice_ready && m_deferred_slices < 3) {
+		std::lock_guard lock(m_operation_mutex);
+		const auto tick = CurrentTick();
+		// Older completions already have a submit. Only this recording needs to start now.
+		if (m_priority_active_tick < tick &&
+		    (m_priority_operations.empty() || m_priority_operations.back().tick < tick)) {
+			m_deferred_slices++;
+			return;
+		}
 	}
 	Flush();
 }

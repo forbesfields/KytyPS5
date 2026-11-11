@@ -88,9 +88,8 @@ void CheckFewerSubmits() {
   uint32_t wait_label = 0;
   uint64_t deferred_tick = 0;
   gpu.SendCommandSync([&] {
-    processor.BufferInit();
     deferred_tick = scheduler.CurrentTick();
-    processor.BufferFlush(true);
+    scheduler.FlushSlice(true);
   });
   const auto label_address = reinterpret_cast<uint64_t>(&wait_label);
   const std::array<uint32_t, 7> wait_packet{
@@ -123,6 +122,13 @@ void CheckFewerSubmits() {
   Require(name, "guest queue boundaries", scheduler.CurrentTick() == switch_tick + 4,
           "batching crossed a guest queue switch");
 
+  const auto late_queue_tick = scheduler.CurrentTick();
+  gpu.SendCommandSync([&] { scheduler.FlushSlice(true); });
+  gpu.SubmitCompute(0x20u, nop);
+  gpu.WaitForIdle();
+  Require(name, "late guest queue switch", scheduler.CurrentTick() == late_queue_tick + 2,
+          "a queue that became ready after deferral shared the previous queue's recording");
+
   // The callback runner waits on a deliberately blocked submission. Its wait is not a GPU-lane wait.
   vk::SemaphoreTypeCreateInfo type{};
   type.semaphoreType = vk::SemaphoreType::eTimeline;
@@ -137,6 +143,12 @@ void CheckFewerSubmits() {
     submit.AddWait(gate, 1);
     scheduler.DeferPriorityOperation([] {});
     scheduler.Flush(submit);
+    const auto old_completion_tick = scheduler.CurrentTick();
+    scheduler.FlushSlice(true);
+    Require(name, "submitted completion", scheduler.CurrentTick() ==
+                old_completion_tick + (enabled ? 0u : 1u),
+            "an already submitted completion prevented batching a new slice");
+    scheduler.FlushSlice(false);
   });
   const auto during_background = CommandScheduler::GetGpuThreadWaitStats();
   Require(name, "background metric", during_background.count == before_background.count &&
