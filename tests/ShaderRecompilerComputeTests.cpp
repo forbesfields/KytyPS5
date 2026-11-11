@@ -55501,6 +55501,8 @@ void CheckDeviceCreation() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+#include "FewerSubmitsTests.inc"
+
 // R_FLIP itself publishes the dumped occlusion counters, then flips.
 void CheckPm4Flip() {
   namespace EventQueue = LibKernel::EventQueue;
@@ -55561,7 +55563,7 @@ void CheckPm4Flip() {
     for (const auto counter : results) {
       published &= (counter & OCCLUSION_QUERY_READY) != 0;
     }
-    processor.BufferFlush();
+    // The flip must submit its prepared frame now. No end-of-slice flush follows this call.
   });
 
   // A present stalled on the graphics queue leaves the port readable.
@@ -56870,6 +56872,10 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--scalar-leaf-call-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckScalarLeafCall();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--fewer-submits-only") == 0) {
+    CheckFewerSubmits();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {

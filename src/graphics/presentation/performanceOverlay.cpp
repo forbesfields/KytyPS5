@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/hostStats.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "imgui.h"
 #include "kernel/memory.h"
 
@@ -34,7 +35,10 @@ constexpr size_t FRAME_HISTORY     = 120;
 constexpr float  FRAME_GRAPH_MS    = 50.0f;
 constexpr float  FRAME_TIME_GOOD   = 17.5f;
 constexpr float  FRAME_TIME_MEDIUM = 34.0f;
-constexpr size_t COUNTER_COUNT     = static_cast<size_t>(Counter::Count);
+// Scheduler waits exclude the background completion runner and other host threads.
+constexpr size_t GPU_THREAD_WAITS   = static_cast<size_t>(Counter::Count);
+constexpr size_t GPU_THREAD_WAIT_NS = GPU_THREAD_WAITS + 1;
+constexpr size_t COUNTER_COUNT     = GPU_THREAD_WAIT_NS + 1;
 constexpr auto   HITCH_WINDOW      = std::chrono::seconds(10);
 // At least 50 ms per hitch means at most 200 can finish in a ten-second window.
 constexpr size_t HITCH_HISTORY     = 256;
@@ -43,9 +47,12 @@ using CounterTotals = std::array<uint64_t, COUNTER_COUNT>;
 
 CounterTotals ReadCounters() {
 	CounterTotals totals {};
-	for (size_t i = 0; i < totals.size(); i++) {
+	for (size_t i = 0; i < static_cast<size_t>(Counter::Count); i++) {
 		totals[i] = Common::DebugCounters::Get(static_cast<Counter>(i));
 	}
+	const auto waits = CommandScheduler::GetGpuThreadWaitStats();
+	totals[GPU_THREAD_WAITS] = waits.count;
+	totals[GPU_THREAD_WAIT_NS] = waits.nanoseconds;
 	return totals;
 }
 
@@ -375,8 +382,18 @@ void TransferRow(const Snapshot& shown, const char* label, Counter upload, Count
 void GpuActivityRows(const Snapshot& shown) {
 	const auto draws = Rate(shown, Counter::Draws);
 	Row("Draw calls", Fmt("%.0f/frame  %.0f/s", draws / std::max(shown.fps, 1.0), draws));
-	// Includes present pacing waits, so a high value alone is not a stall.
-	Row("CPU waiting on GPU",
+	const auto submits = Rate(shown, Counter::QueueSubmits);
+	Row("Queue submits", shown.frame_count > 0
+	                         ? Fmt("%.1f/frame  %.0f/s",
+	                               static_cast<double>(shown.deltas[static_cast<size_t>(Counter::QueueSubmits)]) /
+	                                   shown.frame_count,
+	                               submits)
+	                         : Fmt("n/a per frame  %.0f/s", submits));
+	Row("GPU thread scheduler waits",
+	    Fmt("%.0f ms/s  (%.0f waits/s)", shown.rates[GPU_THREAD_WAIT_NS] / 1e6,
+	        shown.rates[GPU_THREAD_WAITS]));
+	// Includes the background completion runner and present pacing waits.
+	Row("All-thread GPU timeline waits",
 	    Fmt("%.0f ms/s  (%.0f waits/s)", Rate(shown, Counter::GpuWaitNs) / 1e6,
 	        Rate(shown, Counter::GpuWaits)));
 	Row("DCC/CMASK readbacks",
@@ -414,7 +431,8 @@ void FrameTimingRows(const Snapshot& shown) {
 	};
 	row("Guest GPU / compile", ms(Counter::GpuThreadBusyNs),
 	    ms(Counter::ShaderCompileNs) + ms(Counter::PipelineCreateNs));
-	row("GPU wait / present", ms(Counter::GpuWaitNs), ms(Counter::PresentNs));
+	row("GPU thread wait / present",
+	    static_cast<double>(shown.deltas[GPU_THREAD_WAIT_NS]) / 1e6, ms(Counter::PresentNs));
 	row("Acquire / overlay", ms(Counter::PresentAcquireNs), ms(Counter::OverlayNs));
 }
 
@@ -429,7 +447,7 @@ std::string HitchActivity(const Hitch& hitch) {
 	};
 	std::array activity {
 	    Activity {"compile", ms(Counter::ShaderCompileNs) + ms(Counter::PipelineCreateNs)},
-	    Activity {"GPU wait", ms(Counter::GpuWaitNs)},
+	    Activity {"GPU thread wait", static_cast<double>(hitch.deltas[GPU_THREAD_WAIT_NS]) / 1e6},
 	    Activity {"readback", ms(Counter::ColorMetadataReadbackNs)},
 	    Activity {"acquire", ms(Counter::PresentAcquireNs)},
 	    Activity {"overlay", ms(Counter::OverlayNs)},
@@ -467,8 +485,9 @@ void Refresh(Snapshot& shown, const GraphicContext& graphics, Clock::time_point 
 	const double seconds = shown.sample_time == Clock::time_point {}
 	                           ? 0.0
 	                           : std::chrono::duration<double>(now - shown.sample_time).count();
+	const auto totals = ReadCounters();
 	for (size_t i = 0; i < COUNTER_COUNT; i++) {
-		const auto value = Common::DebugCounters::Get(static_cast<Counter>(i));
+		const auto value = totals[i];
 		shown.deltas[i] = seconds > 0.0 ? value - shown.totals[i] : 0;
 		shown.rates[i] =
 		    seconds > 0.0 ? static_cast<double>(shown.deltas[i]) / seconds : 0.0;
