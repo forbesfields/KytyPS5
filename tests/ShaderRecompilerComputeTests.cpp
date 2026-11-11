@@ -55655,6 +55655,17 @@ void CheckPm4Flip() {
               flipped_arg == flip_arg,
           "R_FLIP did not publish the occlusion counters or flip");
 
+  // Special flips have no buffer attributes. Cover both negative indices before
+  // the Guest output row reads any registered-buffer dimensions.
+  timeout = 2'000'000;
+  Require(name, "black flip",
+          VideoOut::VideoOutSubmitFlip(handle, -2, 1, flip_arg + 1) == 0 &&
+              EventQueue::KernelWaitEqueue(flips, &event, 1, &count, &timeout) == 0 &&
+              count == 1 &&
+              VideoOut::VideoOutGetEventData(&event, &flipped_arg) == 0 &&
+              flipped_arg == flip_arg + 1,
+          "the black flip did not complete after the blank flip");
+
   // Vblanks while the event is undelivered count in that one event.
   Require(name, "vblank event",
           VideoOut::VideoOutAddVblankEvent(flips, handle, nullptr) == 0,

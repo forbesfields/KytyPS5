@@ -1119,7 +1119,8 @@ bool FlipQueue::Flip() {
 		auto&             r = requests[i];
 		Common::LockGuard lock(r.cfg->mutex);
 		due &= r.cfg->generation == r.generation;
-		if (r.cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN && IsValidBufferIndex(r.index)) {
+		// Blank (-1) and black (-2) are valid flips, but have no registered buffer.
+		if (r.cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN && r.index >= 0 && IsValidBufferIndex(r.index)) {
 			const auto& buffer = r.cfg->buffers[r.index];
 			if (buffer.Occupied()) {
 				const auto& attribute = r.cfg->groups[buffer.group_index].attribute;
