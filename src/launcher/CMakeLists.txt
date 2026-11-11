@@ -59,7 +59,10 @@ add_executable(launcher_output_1080p_tests EXCLUDE_FROM_ALL
 target_link_libraries(launcher_output_1080p_tests Qt6::Widgets common SDL3::SDL3-static Vulkan::Headers)
 target_include_directories(launcher_output_1080p_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(launcher_output_1080p_tests PROPERTIES AUTOMOC ON AUTOUIC ON)
-add_test(NAME launcher_output_1080p COMMAND launcher_output_1080p_tests)
+if(BUILD_TESTING)
+	add_test(NAME launcher_output_1080p COMMAND launcher_output_1080p_tests)
+	add_dependencies(kyty_tests launcher_output_1080p_tests)
+endif()
 
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")

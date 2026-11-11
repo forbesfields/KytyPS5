@@ -859,6 +859,7 @@ if(BUILD_TESTING)
 		memory_tracker_tests
 		page_manager_tests
 		build_flags_tests
+		output_1080p_tests
 		archive_file_tests
 		image_archive_tests
 		trophy_system_tests
