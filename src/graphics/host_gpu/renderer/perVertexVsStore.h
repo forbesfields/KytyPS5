@@ -10,6 +10,9 @@
 
 namespace Libs::Graphics {
 
+// Shader cache modes: 0 uses tessellation, 1 uses mesh records, 2 uses native capture.
+uint32_t PerVertexBufferMode(bool emulated_mesh, bool native_candidate);
+
 // A separate vertex-only draw produces these records. A command buffer barrier makes them
 // visible to the consumer VS and PS. This is portable Vulkan; same-draw vertex stores followed
 // by fragment loads would depend on driver scheduling, even on an Apple tile renderer.

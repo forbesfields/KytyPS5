@@ -11,6 +11,21 @@ TestCompileResult RecompileForVertexStoreTest(std::span<const uint32_t> code,
 // The compute producer and its barrier are the same as the old mesh path.
 void TestPerVertexBufferEmission() {
   using namespace ShaderRecompiler;
+  const auto enabled = [](const char* name) {
+    const auto* value = std::getenv(name);
+    return value == nullptr || std::strcmp(value, "0") != 0;
+  };
+  const bool master = enabled("KYTY_PERF_VS_STORE");
+  const bool native = enabled("KYTY_PERF_VS_STORE_NATIVE");
+  Check(PerVertexBufferMode(true, false) == (master ? 1u : 0u),
+        "native kill switch changed emulated mesh corner storage");
+  Check(PerVertexBufferMode(false, true) == (master && native ? 2u : 0u),
+        "native capture did not select its tessellation fallback mode");
+  Check(PerVertexBufferMode(false, false) == 0u &&
+        PerVertexBufferMode(true, true) == (master ? 1u : 0u),
+        "corner storage mode lost its eligibility or mesh priority");
+  std::printf("VS-store selection: mesh=%u native=%u ineligible=0 (distinct shader cache modes)\n",
+    PerVertexBufferMode(true, false), PerVertexBufferMode(false, true));
   const uint32_t code[]{EncodeVintrp(2, 12, 0, 0, 2), EncodeVintrp(2, 13, 0, 0, 0),
     EncodeVintrp(2, 14, 0, 0, 1), EncodeExp0(0x00, 0xf), EncodeExp1(12, 13, 14, 12),
     EncodeSopp(0x01)};

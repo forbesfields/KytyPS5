@@ -59,6 +59,17 @@ bool PerVertexBufferEnabled() {
 	return enabled;
 }
 
+bool NativeVertexStoreEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PERF_VS_STORE_NATIVE");
+		const bool active = value == nullptr || std::strcmp(value, "0") != 0;
+		Log::WriteToConsoleAndLog(fmt::format("KYTY_PERF_VS_STORE_NATIVE={} (native vertex capture)\n",
+		                                     active ? "1" : "0"));
+		return active;
+	}();
+	return enabled;
+}
+
 bool CornerBufferDescriptorsFit(const vk::PhysicalDeviceLimits& limits, const ShaderModule& vertex,
                                 const ShaderModule& pixel, bool native_store) {
 	if (native_store && limits.maxBoundDescriptorSets < 3u) return false;
@@ -271,6 +282,14 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 }
 
 } // namespace
+
+uint32_t PerVertexBufferMode(bool emulated_mesh, bool native_candidate) {
+	const bool enabled = PerVertexBufferEnabled();
+	const bool native = NativeVertexStoreEnabled();
+	if (!enabled) return 0u;
+	if (emulated_mesh) return 1u;
+	return native_candidate && native ? 2u : 0u;
+}
 
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
@@ -542,7 +561,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	(void)MeshEmulationBatchEnabled();
-	(void)PerVertexBufferEnabled();
+	(void)PerVertexBufferMode(false, false);
 	InitializeDriverCache();
 	WarmUp(shader_store);
 }
@@ -963,14 +982,13 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	    MeshEmulationHeaderDword(last_stage.user_clip_planes) != ShaderRecompiler::IR::PushData::NoStart)
 		push_data_cursor += MeshEmulationLayout::HeaderDwords;
 	if (pixel_active) {
-		state.vertex_store = !mesh_active && !tess_active && !state.force_corner_tessellation &&
-		                     !vertex_info[0].indirect_draw && pixel_info.emulate_per_vertex &&
-		                     PerVertexBufferEnabled();
-		state.per_vertex_buffer = !state.force_corner_tessellation &&
-		                          ((mesh_active && vertex_info[0].mesh.emulated) || state.vertex_store) &&
-		                          pixel_info.emulate_per_vertex && PerVertexBufferEnabled();
-		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor,
-		    state.vertex_store ? 2u : state.per_vertex_buffer ? 1u : 0u);
+		const auto per_vertex_mode = !state.force_corner_tessellation && pixel_info.emulate_per_vertex
+		    ? PerVertexBufferMode(mesh_active && vertex_info[0].mesh.emulated,
+		                          !mesh_active && !tess_active && !vertex_info[0].indirect_draw)
+		    : 0u;
+		state.vertex_store = per_vertex_mode == 2u;
+		state.per_vertex_buffer = per_vertex_mode != 0u;
+		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor, per_vertex_mode);
 		state.per_vertex_buffer &= !pixel_module.triangle_parameters.empty();
 		state.vertex_store &= state.per_vertex_buffer;
 		for (const auto& output: pixel_module.info.info.outputs) {
