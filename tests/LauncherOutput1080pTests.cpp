@@ -4,6 +4,7 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QPushButton>
+#include <QPixmap>
 #include <QScrollArea>
 #include <QTimer>
 #include <QJsonObject>
