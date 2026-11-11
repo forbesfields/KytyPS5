@@ -62,6 +62,9 @@ public:
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
 	void               RunGarbageCollector();
+	// Call before a draw prepares resources or records any bindings.
+	void               PrepareDraw();
+	void               RecordTessellationDraw(uint32_t vertices, uint32_t instances, bool indirect = false);
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -92,6 +95,7 @@ private:
 	uint64_t                   m_budget_log_frame = 0;
 	std::chrono::steady_clock::time_point m_last_pool_reclaim {};
 	bool                       m_reclaim_metal_pool = false;
+	TessellationBatchBudget    m_tessellation_batch;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;

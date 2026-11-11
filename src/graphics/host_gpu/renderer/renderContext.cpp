@@ -172,7 +172,32 @@ void RenderContext::PrepareBda() {
 	m_fault_process_pending = true;
 }
 
+void RenderContext::PrepareDraw() {
+	if (!m_reclaim_metal_pool || !m_tessellation_batch.NeedsReclaim()) {
+		return;
+	}
+	const auto before = m_graphics.GetUnifiedMemoryUsage();
+	m_command_scheduler.RecreateCommandPool();
+	m_tessellation_batch.Reset();
+	m_last_pool_reclaim = std::chrono::steady_clock::now();
+	const auto after = m_graphics.GetUnifiedMemoryUsage();
+	constexpr uint64_t MiB = 1024 * 1024;
+	LOGF("Metal tessellation pool retired: driver=%" PRIu64 " -> %" PRIu64 " MiB\n",
+	     before.driver_bytes / MiB, after.driver_bytes / MiB);
+}
+
+void RenderContext::RecordTessellationDraw(uint32_t vertices, uint32_t instances, bool indirect) {
+	if (m_reclaim_metal_pool) {
+		if (indirect) {
+			m_tessellation_batch.RecordIndirect();
+		} else {
+			m_tessellation_batch.Record(vertices, instances);
+		}
+	}
+}
+
 void RenderContext::RunGarbageCollector() {
+	m_command_scheduler.PopPendingOperations();
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
@@ -185,16 +210,18 @@ void RenderContext::RunGarbageCollector() {
 		auto usage = m_graphics.GetUnifiedMemoryUsage();
 		GpuCacheBudget budget {usage.driver_bytes, *m_unified_cache_limit,
 		                       GraphicContext::GetHostCachePressure()};
-		if (m_reclaim_metal_pool && budget.ShouldReclaimDriverPool(
-		        usage.allocator_block_bytes, std::chrono::steady_clock::now() - m_last_pool_reclaim)) {
+		if (m_reclaim_metal_pool && (m_tessellation_batch.NeedsFrameReclaim() ||
+		    budget.ShouldReclaimDriverPool(usage.allocator_block_bytes,
+		        std::chrono::steady_clock::now() - m_last_pool_reclaim))) {
 			const auto before = usage;
 			m_command_scheduler.RecreateCommandPool();
+			m_tessellation_batch.Reset();
 			usage = m_graphics.GetUnifiedMemoryUsage();
 			budget.used = usage.driver_bytes;
 			budget.host_level = GraphicContext::GetHostCachePressure();
 			// Measure the cooldown in wall time so slow frames do not delay critical reclaim.
 			m_last_pool_reclaim = std::chrono::steady_clock::now();
-			LOGF("Metal command pool reclaimed: driver=%" PRIu64 " -> %" PRIu64
+			LOGF("Metal command pool retired: driver=%" PRIu64 " -> %" PRIu64
 			     " MiB, VMA blocks=%" PRIu64 " -> %" PRIu64 " MiB\n",
 			     before.driver_bytes / MiB, usage.driver_bytes / MiB,
 			     before.allocator_block_bytes / MiB, usage.allocator_block_bytes / MiB);

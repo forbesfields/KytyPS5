@@ -2781,6 +2781,33 @@ public:
         std::ranges::find(blocked_handles, scheduler.Current().Handle()) !=
             blocked_handles.end(),
         "completed command buffers were not reused after timeline progress");
+    // Pool recreation must preserve GPU writes and the stable guest recording wrapper.
+    constexpr const char *retirement_name = "SchedulerPoolRetirementWrites";
+    auto writes = CreateHostBuffer(retirement_name, 16 * sizeof(u32),
+                                   vk::BufferUsageFlagBits::eTransferDst, {});
+    for (u32 i = 0; i < 16; ++i) {
+      scheduler.Current().Handle().fillBuffer(writes.buffer, i * sizeof(u32),
+                                              sizeof(u32), 0xabc00000u + i);
+      scheduler.RecreateCommandPool();
+      Require(retirement_name, "guest recording state",
+              &scheduler.Current() == command &&
+                  &command->GetRegisters() == &registers &&
+                  &command->GetUserConfig() == &user_config &&
+                  &command->GetShaders() == &shaders,
+              "pool recreation lost the guest recording state");
+    }
+    vk::MemoryBarrier retirement_to_host{};
+    retirement_to_host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    retirement_to_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 1, &retirement_to_host, 0, nullptr, 0, nullptr);
+    scheduler.Finish();
+    const auto retired_words = ReadBuffer(retirement_name, writes, 16);
+    for (u32 i = 0; i < 16; ++i) {
+      Require(retirement_name, "GPU contents", retired_words[i] == 0xabc00000u + i,
+              "retiring a pending command pool lost a recorded GPU write");
+    }
+    DestroyBuffer(&writes);
     scheduler.Shutdown();
 
     CommandScheduler draining(Renderer(), m_runtime_context);
@@ -5364,7 +5391,7 @@ public:
                        false);
 
       for (uint32_t tick = 0; tick < 160; tick++) {
-        cache.RunGarbageCollector();
+        cache.RunGarbageCollector(nullptr);
       }
       Require(name, "age before pressure",
               cache.IsRegionRegistered(base, allocation_size),
@@ -5372,7 +5399,7 @@ public:
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
       const auto gc_submission_tick = scheduler.CurrentTick();
-      cache.RunGarbageCollector();
+      cache.RunGarbageCollector(nullptr);
       uint32_t first_before_completion = 0;
       uint32_t second_before_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + first_offset,
@@ -5416,7 +5443,7 @@ public:
         }
         release_older_publication.release();
       });
-      cache.RunGarbageCollector();
+      cache.RunGarbageCollector(nullptr);
       gc_returned = true;
       release_publication.join();
       scheduler.WaitPriorityOperations(older_publication_tick);
@@ -5458,7 +5485,7 @@ public:
                          false);
       }
       for (uint32_t tick = 0; tick < 160; tick++) {
-        cache.RunGarbageCollector();
+        cache.RunGarbageCollector(nullptr);
       }
       constexpr uint64_t starvation_clean_offset =
           starvation_offset + starvation_count * starvation_stride;
@@ -5468,11 +5495,11 @@ public:
               static_cast<bool>(starvation_clean),
               "failed to create the clean starvation candidate");
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        cache.RunGarbageCollector(nullptr);
       }
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
-      cache.RunGarbageCollector();
+      cache.RunGarbageCollector(nullptr);
       Require(
           name, "normal-GC dirty bypass",
           cache.IsRegionRegistered(base + starvation_offset,
@@ -5487,7 +5514,7 @@ public:
       BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
       const auto starvation_retired =
           BufferCacheTestAccess::PageOwner(cache, base + starvation_offset);
-      cache.RunGarbageCollector();
+      cache.RunGarbageCollector(nullptr);
       Require(name, "critical-GC starvation cleanup",
               !cache.IsRegionRegistered(base + starvation_offset,
                                         sizeof(starvation_value)) &&
@@ -5511,7 +5538,7 @@ public:
       const auto obtained =
           cache.FindBuffer(base + obtained_offset, residency_size);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        cache.RunGarbageCollector(nullptr);
       }
       Require(name, "lookup-only owner identity",
               cache.FindBuffer(base + lookup_only_offset, residency_size) ==
@@ -5521,7 +5548,7 @@ public:
           base + obtained_offset, residency_size, false, false, obtained);
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
-      cache.RunGarbageCollector();
+      cache.RunGarbageCollector(nullptr);
       Require(name, "lookup versus acquisition residency",
               !cache.IsRegionRegistered(base + lookup_only_offset,
                                         residency_size) &&
@@ -5623,7 +5650,7 @@ public:
         cache.FillBuffer(base + large_offset, large_size, large_value, false);
         const auto large_submission_tick = scheduler.CurrentTick();
         for (uint32_t tick = 0; tick <= 160; tick++) {
-          cache.RunGarbageCollector();
+          cache.RunGarbageCollector(nullptr);
         }
         // The capacity-sized case can wrap the ring; the oversized case must
         // keep its separate staging allocation alive through publication.
@@ -5684,7 +5711,7 @@ public:
       cache.FillBuffer(base + grouped_second_offset, grouped_owner_size,
                        grouped_second_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        cache.RunGarbageCollector(nullptr);
       }
       Require(name, "per-owner fixed-ring retirement",
               !cache.IsRegionRegistered(base + grouped_first_offset,
@@ -5786,7 +5813,7 @@ public:
               "sparse GC fixtures merged into one source owner");
       const auto sparse_gc_tick = scheduler.CurrentTick();
       for (uint32_t tick = 0; tick <= 160; ++tick) {
-        cache.RunGarbageCollector();
+        cache.RunGarbageCollector(nullptr);
       }
       Require(name, "sparse multi-owner GC submission",
               scheduler.CurrentTick() == sparse_gc_tick + 1 &&
@@ -5814,7 +5841,7 @@ public:
       cache.FillBuffer(base + disjoint_dirty_offset, sizeof(disjoint_value),
                        disjoint_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        cache.RunGarbageCollector(nullptr);
       }
       Require(name, "disjoint synchronized retirement",
               !cache.IsRegionRegistered(base + disjoint_owner_offset,
@@ -5876,7 +5903,7 @@ public:
       cache.FillBuffer(base + reacquire_dirty_offset, sizeof(reacquire_value),
                        reacquire_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        cache.RunGarbageCollector(nullptr);
       }
       Require(name, "reacquire synchronized retirement",
               !cache.IsRegionRegistered(base + reacquire_owner_offset,
@@ -6725,7 +6752,7 @@ public:
     // Garbage collection untracks a clean buffer; its replacement queues the range on Register.
     BufferCacheTestAccess::SetGarbageCollectionThresholds(
         cache, 0, std::numeric_limits<uint64_t>::max());
-    cache.RunGarbageCollector();
+    cache.RunGarbageCollector(nullptr);
     Require(name, "clean eviction", !cache.IsRegionRegistered(base, 3 * page),
             "garbage collection kept the clean buffer");
     (void)cache.FindBuffer(base, 3 * page);
@@ -10337,7 +10364,7 @@ public:
       }
       TextureCacheTestAccess::ConfigureGarbageCollection(
           texture_cache, gc_images, 17, UINT64_MAX);
-      texture_cache.RunGarbageCollector();
+      texture_cache.RunGarbageCollector(nullptr);
       Require(name, "downloadable image pre-pressure retention",
               std::ranges::all_of(gc_images,
                                   [&](ImageId image) {
@@ -10348,7 +10375,7 @@ public:
       const auto gc_batch_tick = scheduler.CurrentTick();
       TextureCacheTestAccess::ConfigureGarbageCollection(texture_cache,
                                                          gc_images, 81, 0);
-      texture_cache.RunGarbageCollector();
+      texture_cache.RunGarbageCollector(nullptr);
       std::array<uint32_t, 2> gc_before_completion{};
       for (size_t index = 0; index < gc_image_offsets.size(); index++) {
         Libs::LibKernel::Memory::TryReadBacking(base + gc_image_offsets[index],
@@ -10926,7 +10953,7 @@ public:
       }
       TextureCacheTestAccess::ConfigureGarbageCollection(
           texture_cache, std::array{combined_destination_image}, 81, 0);
-      texture_cache.RunGarbageCollector();
+      texture_cache.RunGarbageCollector(nullptr);
       Require(name, "depth/stencil pressure retention",
               TextureCacheTestAccess::Contains(texture_cache,
                                                combined_destination_image),
@@ -10970,7 +10997,7 @@ public:
           "failed to create eleven depth/stencil association pairs");
       TextureCacheTestAccess::ConfigureGarbageCollection(
           texture_cache, gc_depth_lru, 81, UINT64_MAX);
-      texture_cache.RunGarbageCollector();
+      texture_cache.RunGarbageCollector(nullptr);
       bool gc_depth_budget = true;
       for (size_t index = 0; index < gc_depth_pair_count; index++) {
         const bool expected_live = index == gc_depth_pair_count - 1;
@@ -11013,7 +11040,7 @@ public:
         TextureCacheTestAccess::ConfigureGarbageCollection(
             texture_cache, std::array{image}, 81, 0);
         const auto tick = scheduler.CurrentTick();
-        texture_cache.RunGarbageCollector();
+        texture_cache.RunGarbageCollector(nullptr);
         const auto handle =
             BufferCacheTestAccess::DownloadBuffer(resources.GetBufferCache())
                 .Handle();
@@ -11063,7 +11090,7 @@ public:
       }
       TextureCacheTestAccess::ConfigureGarbageCollection(
           texture_cache, gc_kept_lru, 17, UINT64_MAX);
-      texture_cache.RunGarbageCollector();
+      texture_cache.RunGarbageCollector(nullptr);
       Require(name, "kept images outside the deletion budget",
               !TextureCacheTestAccess::Contains(texture_cache,
                                                 gc_kept_lru.back()) &&

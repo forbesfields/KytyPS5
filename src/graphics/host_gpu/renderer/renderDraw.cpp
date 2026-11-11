@@ -1066,6 +1066,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	const bool  mesh_active   = state.vertex_info[0].stage.module->info.stage == ShaderType::Mesh;
 	const bool  mesh_task     = state.vertex_info[0].stage.module->mesh_task;
 	const bool  emulated_mesh = state.vertex_info[0].stage.module->MeshEmulated();
+	const bool tessellation = vertex_stages.size() == 3 ||
+	    (!mesh_active && state.topology == vk::PrimitiveTopology::ePatchList) ||
+	    (state.ps_active && !state.ps_input_info.stage.module->triangle_parameters.empty());
 	const auto& mesh          = state.vertex_info[0].mesh;
 	const auto& limits        = m_context.GetGraphics().mesh_shader_properties;
 	uint32_t    mesh_groups   = 0;
@@ -1319,6 +1322,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 				vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 				const auto query = queries.Begin(vk_buffer);
 				vk_buffer.draw(count * mesh.max_primitives * 3u, 1u, 0u, 0u);
+				if (tessellation) {
+					m_context.RecordTessellationDraw(count * mesh.max_primitives * 3u, 1u);
+				}
 				queries.End(vk_buffer, query);
 				buffer.EndRendering();
 				if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage))
@@ -1349,6 +1355,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		                       emit.indirect.count, emit.indirect.stride);
 	}
 	occlusion_queries.End(vk_buffer, occlusion_query);
+	if (tessellation) {
+		m_context.RecordTessellationDraw(host_draw.index_count, draw.instance_count,
+		                                emit.indirect.address != 0);
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
@@ -1397,6 +1407,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+	m_context.PrepareDraw();
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
@@ -1489,6 +1500,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+	m_context.PrepareDraw();
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();

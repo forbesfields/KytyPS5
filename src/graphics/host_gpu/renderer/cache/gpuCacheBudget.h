@@ -45,6 +45,29 @@ struct GpuCacheBudget {
 	}
 };
 
+// Bound the work retained by one MoltenVK pool without waiting at every small draw.
+// This is a soft work limit, not a byte cap: one guest draw can exceed it. GPU-only
+// indirect counts are retired at the frame boundary instead of forcing a reset per draw.
+struct TessellationBatchBudget {
+	static constexpr uint64_t MaxVertices = 512 * 1024;
+
+	void Record(uint32_t vertices, uint32_t instances) {
+		m_vertices += std::min(MaxVertices, uint64_t {vertices} * instances);
+		m_vertices = std::min(m_vertices, MaxVertices);
+	}
+	void RecordIndirect() { m_indirect = true; }
+	[[nodiscard]] bool NeedsReclaim() const { return m_vertices >= MaxVertices; }
+	[[nodiscard]] bool NeedsFrameReclaim() const { return m_indirect || NeedsReclaim(); }
+	void Reset() {
+		m_vertices = 0;
+		m_indirect = false;
+	}
+
+private:
+	uint64_t m_vertices = 0;
+	bool     m_indirect = false;
+};
+
 [[nodiscard]] constexpr uint64_t TextureReclaimAge(CacheReclaimLevel level) {
 	return level == CacheReclaimLevel::Critical ? 4
 	       : level == CacheReclaimLevel::Pressure ? 8

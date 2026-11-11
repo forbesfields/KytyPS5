@@ -64,6 +64,31 @@ int main() {
 	Check(!stale_usage.ShouldReclaimDriverPool(7 * GiB, 10s),
 	      "a stale driver sample must not wrap the untracked byte count");
 
+	Libs::Graphics::TessellationBatchBudget batch;
+	Check(!batch.NeedsReclaim(), "an empty pool needs no tessellation reclaim");
+	for (unsigned draw = 0; draw < 18; ++draw) {
+		batch.Record(28416, 1);
+	}
+	Check(!batch.NeedsReclaim(), "eighteen captured draws fit in the tessellation batch");
+	batch.Record(28416, 1);
+	Check(batch.NeedsReclaim(), "a nineteenth draw schedules retirement at the next boundary");
+	batch.Reset();
+	Check(!batch.NeedsFrameReclaim(), "pool retirement resets accumulated tessellation work");
+	for (unsigned draw = 0; draw < 100; ++draw) batch.RecordIndirect();
+	Check(!batch.NeedsReclaim() && batch.NeedsFrameReclaim(),
+	      "GPU-only indirect counts retire once per frame, not once per draw");
+	batch.Reset();
+	Check(!batch.NeedsFrameReclaim(), "pool retirement clears indirect work too");
+	batch.Record(28416, 19);
+	Check(batch.NeedsReclaim(), "all instances count towards the pool lifetime");
+	batch.Reset();
+	batch.Record(UINT32_MAX, UINT32_MAX);
+	batch.Record(UINT32_MAX, UINT32_MAX);
+	Check(batch.NeedsReclaim(), "very large repeated draws must not overflow accounting");
+	batch.Reset();
+	batch.Record(UINT32_MAX, 0);
+	Check(!batch.NeedsReclaim(), "zero instances allocate no tessellation output");
+
 	Common::LeastRecentlyUsedCache<int, uint64_t> textures;
 	(void)textures.Insert(1, 12);
 	(void)textures.Insert(2, 30);
