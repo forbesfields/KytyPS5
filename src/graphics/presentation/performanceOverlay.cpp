@@ -14,12 +14,16 @@
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <fmt/format.h>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -28,6 +32,83 @@ namespace {
 using Clock   = std::chrono::steady_clock;
 using Counter = Common::DebugCounters::Counter;
 using Peak    = Common::DebugCounters::Peak;
+
+// Guest flip intervals, independent of the overlay. Keep the samples so the
+// benchmark can compute exact percentiles across several log windows.
+bool PerfLogEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PERF_LOG");
+		const bool on = value != nullptr && std::string_view(value) == "1";
+		std::printf("KYTY_PERF_LOG=%d\n", on);
+		return on;
+	}();
+	return enabled;
+}
+
+struct PerfLog {
+	std::mutex          mutex;
+	Clock::time_point   start {};
+	Clock::time_point   window_start {};
+	Clock::time_point   last_flip {};
+	uint64_t            total_frames = 0;
+	std::vector<double> intervals_ms;
+
+	void Record() {
+		std::scoped_lock lock(mutex);
+		const auto now = Clock::now();
+		if (last_flip == Clock::time_point {}) {
+			start = window_start = now;
+		} else {
+			intervals_ms.push_back(std::chrono::duration<double, std::milli>(now - last_flip).count());
+		}
+		last_flip = now;
+		total_frames++;
+	}
+
+	void Print() {
+		std::unique_lock lock(mutex);
+		const auto now = Clock::now();
+		if (start == Clock::time_point {} || now - window_start < std::chrono::seconds(5)) {
+			return;
+		}
+		const double seconds = std::chrono::duration<double>(now - window_start).count();
+		const double elapsed = std::chrono::duration<double>(now - start).count();
+		const double unix_s = std::chrono::duration<double>(
+		    std::chrono::system_clock::now().time_since_epoch()).count();
+		const auto frames = total_frames;
+		std::vector<double> samples;
+		samples.swap(intervals_ms);
+		window_start = now;
+		// Sort and write outside the flip lock. Log I/O must not block a frame.
+		lock.unlock();
+		double sum = 0.0;
+		for (double ms: samples) {
+			sum += ms;
+		}
+		std::sort(samples.begin(), samples.end());
+		const size_t count = samples.size();
+		const double mean = count == 0 ? 0.0 : sum / count;
+		const double median = count == 0 ? 0.0 :
+		    (samples[(count - 1) / 2] + samples[count / 2]) * 0.5;
+		const double p95 = count == 0 ? 0.0 : samples[(count * 95 + 99) / 100 - 1];
+		std::string line = fmt::format(
+		    "KYTY_PERF {{\"v\":1,\"source\":\"guest_flip\",\"elapsed_s\":{:.6f},"
+		    "\"unix_s\":{:.6f},\"window_s\":{:.6f},\"frames\":{},\"total_frames\":{},"
+		    "\"fps\":{:.6f},\"mean_ms\":{:.6f},\"median_ms\":{:.6f},\"p95_ms\":{:.6f},\"frame_ms\":[",
+		    elapsed, unix_s, seconds, count, frames, count / seconds, mean, median, p95);
+		for (size_t i = 0; i < count; i++) {
+			if (i != 0) {
+				line += ',';
+			}
+			line += fmt::format("{:.6f}", samples[i]);
+		}
+		line += "]}\n";
+		std::fwrite(line.data(), 1, line.size(), stdout);
+		std::fflush(stdout);
+	}
+};
+
+PerfLog g_perf_log;
 
 constexpr auto   REFRESH_INTERVAL  = std::chrono::seconds(1);
 constexpr size_t FRAME_HISTORY     = 120;
@@ -181,7 +262,7 @@ void SamplerThread(const std::stop_token& stop) {
 	uint64_t                                sampled_generation = 0;
 	std::unique_lock                        lock(g_host_mutex);
 	while (!stop.stop_requested()) {
-		g_sampler_wait.wait(lock, stop, [] { return Common::DebugCounters::Enabled(); });
+		g_sampler_wait.wait(lock, stop, [] { return Common::DebugCounters::Enabled() || PerfLogEnabled(); });
 		if (stop.stop_requested()) {
 			break;
 		}
@@ -192,6 +273,9 @@ void SamplerThread(const std::stop_token& stop) {
 			sampled_generation = generation;
 		}
 		auto stats = sampler->Sample();
+		if (PerfLogEnabled()) {
+			g_perf_log.Print();
+		}
 		lock.lock();
 		g_host_stats      = std::move(stats);
 		g_host_generation = generation;
@@ -199,7 +283,7 @@ void SamplerThread(const std::stop_token& stop) {
 			g_revision.fetch_add(1, std::memory_order_acq_rel);
 		}
 		g_sampler_wait.wait_for(lock, stop, REFRESH_INTERVAL, [generation] {
-			return !Common::DebugCounters::Enabled() ||
+			return (!Common::DebugCounters::Enabled() && !PerfLogEnabled()) ||
 			       generation != g_generation.load(std::memory_order_acquire);
 		});
 	}
@@ -746,6 +830,10 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 } // namespace
 
 void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept {
+	if (PerfLogEnabled()) {
+		g_perf_log.Record();
+		EnsureSampler();
+	}
 	if (!Common::DebugCounters::Enabled()) {
 		return;
 	}
