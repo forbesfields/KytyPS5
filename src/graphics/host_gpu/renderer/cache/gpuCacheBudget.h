@@ -51,11 +51,6 @@ struct GpuCacheBudget {
 struct TessellationBatchBudget {
 	static constexpr uint64_t MaxVertices = 512 * 1024;
 
-	// Avoid a queue-wide wait when driver allocations already fit in tracked VMA blocks.
-	[[nodiscard]] static constexpr bool HasDriverOverhead(uint64_t driver_bytes, uint64_t allocator_blocks) {
-		return SubtractBytes(driver_bytes, allocator_blocks) >= 128ull * 1024 * 1024;
-	}
-
 	void Record(uint32_t vertices, uint32_t instances) {
 		m_vertices += std::min(MaxVertices, uint64_t {vertices} * instances);
 		m_vertices = std::min(m_vertices, MaxVertices);
