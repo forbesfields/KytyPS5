@@ -23666,7 +23666,8 @@ private:
   }
 
   void Init() {
-    static vk::detail::DynamicLoader loader;
+    const auto *library = std::getenv("KYTY_TEST_VULKAN_LIBRARY");
+    static vk::detail::DynamicLoader loader(library != nullptr ? library : "");
     const auto get_instance_proc_addr =
         loader.getProcAddress<PFN_vkGetInstanceProcAddr>(
             "vkGetInstanceProcAddr");
