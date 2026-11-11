@@ -7881,10 +7881,12 @@ void TestMeshExportStorage(bool emulated = false) {
     uint32_t subgroup_size, push_data_start;
     bool split;
   };
+  const auto draw_prefix = PushData::MeshDrawDwordCount +
+      (emulated && MeshEmulationBatchEnabled() ? MeshEmulationLayout::HeaderDwords : 0u);
   const Case cases[] = {
-      {32u, PushData::MeshDrawDwordCount, true}, {64u, PushData::MeshDrawDwordCount, true},
+      {32u, draw_prefix, true}, {64u, draw_prefix, true},
       {32u, PushData::DwordCount, true}, {64u, PushData::DwordCount, true},
-      {32u, PushData::MeshDrawDwordCount, false}, {64u, PushData::MeshDrawDwordCount, false},
+      {32u, draw_prefix, false}, {64u, draw_prefix, false},
       {32u, PushData::DwordCount, false}, {64u, PushData::DwordCount, false},
   };
   for (const auto [subgroup_size, push_data_start, split] : cases) {
@@ -7895,7 +7897,7 @@ void TestMeshExportStorage(bool emulated = false) {
         options, push_data_start);
     CheckSpirvBinaryValidates(result.spirv);
     const auto &layout = result.program.bindings;
-    Check(layout.UsesPushData() == (push_data_start == PushData::MeshDrawDwordCount) &&
+    Check(layout.UsesPushData() == (push_data_start == draw_prefix) &&
               layout.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] == 1,
           "mesh shader did not retain its user-data placement and buffer offset");
     const auto reg = std::ranges::find(result.program.info.user_data_registers, 13u);
@@ -7907,6 +7909,19 @@ void TestMeshExportStorage(bool emulated = false) {
                 source.find("OpSetMeshOutputsEXT") == std::string::npos &&
                 source.find("TaskPayloadWorkgroupEXT") == std::string::npos,
             "emulated mesh still requires native mesh or task shader support");
+      const auto header = MeshEmulationHeaderDword(input.user_clip_planes);
+      if (header != PushData::NoStart) {
+        for (uint32_t i = 0; i < MeshEmulationLayout::HeaderDwords; ++i) {
+          const auto operand = "vsharp %uint_0 %uint_" + std::to_string(header + i);
+          Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", operand.c_str()),
+                "mesh header did not use its reserved push constants");
+        }
+      }
+      const auto user_dword = static_cast<uint32_t>(reg - result.program.info.user_data_registers.begin());
+      const auto operand = std::string(layout.UsesPushData() ? "vsharp" : "shader_data") +
+          " %uint_0 %uint_" + std::to_string(user_dword + (layout.UsesPushData() ? push_data_start : 0u));
+      Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", operand.c_str()),
+            "mesh header changed the user-data placement");
       const auto output_layout = BuildMeshEmulationLayout(result.program.info.outputs, input);
       const auto vertex = BuildMeshEmulationVertexShader(output_layout, mesh.provoking_vertex);
       CheckSpirvBinaryValidates(vertex);
@@ -13764,6 +13779,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mesh-emulation-only") == 0) {
+    TestMeshEmulationBatchPlan();
     TestMeshExportStorage(true);
     std::puts("ShaderCfgTests: mesh compute and vertex specialization passed");
     return 0;

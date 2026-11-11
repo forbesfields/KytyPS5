@@ -138,6 +138,9 @@ void EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitMeshEmulationHeaderLoad(EmitterState& state, uint32_t index) {
+	const auto start = MeshEmulationHeaderDword(state.user_clip_planes);
+	if (start != IR::PushData::NoStart)
+		return EmitPushDataLoad(state, ConstantU32(state, start + index));
 	const auto pointer = state.builder.AllocateId();
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain,
@@ -178,6 +181,16 @@ static void EmitEmulatedMeshOutputs(EmitterState& state, uint32_t vertices, uint
 		const auto first = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), first, index, ConstantU32(state, 0u));
 		EmitIfCondition(state, first, [&] {
+			if (MeshEmulationHeaderDword(state.user_clip_planes) != IR::PushData::NoStart) {
+				// One invocation writes the draw header for the generated vertex shader.
+				const auto first_group = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpIEqual, TypeBool(state), first_group,
+				                          group, ConstantU32(state, 0u));
+				EmitIfCondition(state, first_group, [&] {
+					for (uint32_t i = 0; i < MeshEmulationLayout::HeaderDwords; ++i)
+						Store(ConstantU32(state, i), EmitMeshEmulationHeaderLoad(state, i));
+				});
+			}
 			Store(base, vertices);
 			Store(EmitAddU32(state, base, ConstantU32(state, 1u)), primitives);
 		});
