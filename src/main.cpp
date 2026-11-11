@@ -46,6 +46,7 @@ static void PrintUsage() {
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --hdr                                Enable HDR10 output when supported.\n");
+	::printf("  --output-1080p                       Report a 1920x1080 display to the game. Default: off.\n");
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf(
@@ -189,6 +190,7 @@ static constexpr Flag FLAGS[] = {
     {"--rd", &ConfigOptions::renderdoc_enabled},
     {"--fullscreen", &ConfigOptions::fullscreen_enabled},
     {"--hdr", &ConfigOptions::hdr_enabled},
+    {"--output-1080p", &ConfigOptions::output_1080p_enabled},
     {"--hide-cursor", &ConfigOptions::hide_cursor_enabled},
     {"--stretch", &ConfigOptions::stretch_enabled},
     {"--no-splash", &ConfigOptions::splash_enabled, false},

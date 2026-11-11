@@ -116,6 +116,7 @@ public:
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
+	bool                   output_1080p_enabled        = false;
 	bool                   hide_cursor_enabled         = false;
 	bool                   stretch_enabled             = false;
 	bool                   readback_linear_images      = false;
@@ -166,6 +167,7 @@ public:
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hdr_enabled                 = other.hdr_enabled;
+		output_1080p_enabled        = other.output_1080p_enabled;
 		hide_cursor_enabled         = other.hide_cursor_enabled;
 		stretch_enabled             = other.stretch_enabled;
 		readback_linear_images      = other.readback_linear_images;

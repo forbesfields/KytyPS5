@@ -270,6 +270,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	AddFlag(args, info.fullscreen_enabled, "--fullscreen");
 	AddFlag(args, info.hdr_enabled, "--hdr");
+	AddFlag(args, info.output_1080p_enabled, "--output-1080p");
 	AddFlag(args, info.hide_cursor_enabled, "--hide-cursor");
 	AddFlag(args, info.stretch_enabled, "--stretch");
 	AddFlag(args, info.readback_linear_images, "--readback-linear-images");
