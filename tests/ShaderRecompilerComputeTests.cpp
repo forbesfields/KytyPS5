@@ -212,6 +212,31 @@ struct BufferCacheTestAccess {
   }
 };
 
+// Counts the vkCmdPipelineBarrier and vkCmdCopyBuffer calls recorded while it lives.
+struct RecordedCommandCounter {
+  static inline uint32_t barriers = 0;
+  static inline uint32_t copies = 0;
+  static inline PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
+  static inline PFN_vkCmdCopyBuffer copy_buffer = nullptr;
+
+  RecordedCommandCounter() {
+    auto &dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+    barriers = copies = 0;
+    pipeline_barrier = std::exchange(dispatcher.vkCmdPipelineBarrier, [](auto... args) {
+      ++barriers;
+      pipeline_barrier(args...);
+    });
+    copy_buffer = std::exchange(dispatcher.vkCmdCopyBuffer, [](auto... args) {
+      ++copies;
+      copy_buffer(args...);
+    });
+  }
+  ~RecordedCommandCounter() {
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPipelineBarrier = pipeline_barrier;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdCopyBuffer = copy_buffer;
+  }
+};
+
 struct StreamBufferTestAccess {
   static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t &size,
                                    uint64_t &alignment) {
@@ -316,20 +341,17 @@ struct TextureCacheTestAccess {
   static std::vector<ImageId> FindImages(TextureCache &cache, uint64_t address,
                                          uint64_t size) {
     std::lock_guard lock(cache.m_lock);
-    const auto found = cache.FindImagesInRegion(address, size);
     std::vector<ImageId> result;
-    result.reserve(found.size());
-    for (const auto id : found) {
-      result.push_back(id);
-    }
+    cache.ForEachImageInRegion(
+        address, size, [&](ImageId id, Image &) { result.push_back(id); });
     return result;
   }
 
   static size_t PageOwnerCount(TextureCache &cache, uint64_t address) {
     std::lock_guard lock(cache.m_lock);
-    const auto *owners = cache.m_image_page_table.Find(static_cast<size_t>(
+    const auto *bucket = cache.m_image_page_table.Find(static_cast<size_t>(
         address >> TextureCache::ImagePageTable::kPageBits));
-    return owners == nullptr ? 0 : owners->size();
+    return bucket == nullptr ? 0 : bucket->entries.size();
   }
 
   static size_t OwnedPageCount(TextureCache &cache, uint64_t address,
@@ -341,9 +363,11 @@ struct TextureCacheTestAccess {
     }
     size_t count = 0;
     for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
-      const auto *owners = cache.m_image_page_table.Find(page);
-      count += owners != nullptr &&
-               std::find(owners->begin(), owners->end(), id) != owners->end();
+      const auto *bucket = cache.m_image_page_table.Find(page);
+      count += bucket != nullptr &&
+               std::ranges::find(bucket->entries, id,
+                                 &TextureCache::BucketEntry::id) !=
+                   bucket->entries.end();
     }
     return count;
   }
@@ -423,6 +447,10 @@ struct RenderExecutorTestAccess {
   static bool DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
     return executor.DrawAuto(command, args);
+  }
+
+  static uint32_t ColorTargetCount(const RenderExecutor &executor) {
+    return executor.m_targets.color_count;
   }
 
   static bool TryConsumeComputeFill(RenderExecutor &executor,
@@ -1397,6 +1425,8 @@ void CheckLeastRecentlyUsedCacheOrdering() {
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
+  // Loads from an unaccessed mapping must record its first page.
+  bool accessed = true;
 };
 
 using ShaderProfile = ShaderRecompiler::Spirv::Profile;
@@ -6694,13 +6724,22 @@ public:
     context.MapMemory(base + 2 * page, page);
     const auto id = cache.FindBuffer(base, 3 * page);
     auto &buffer = cache.GetBuffer(id);
-    auto readback = CreateHostBuffer(name, 6 * sizeof(u32),
+    auto readback = CreateHostBuffer(name, 11 * sizeof(u32),
                                      vk::BufferUsageFlagBits::eTransferDst, {});
-    const auto snapshot = [&](uint64_t offset, uint32_t index) {
+    const auto snapshot_of = [&](const auto &source, uint64_t offset, uint32_t index) {
       const vk::BufferCopy copy{offset, index * sizeof(u32), sizeof(u32)};
-      scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+      scheduler.Current().Handle().copyBuffer(source.Handle(), readback.buffer, 1, &copy);
     };
-    context.PrepareBda();
+    const auto snapshot = [&](uint64_t offset, uint32_t index) {
+      snapshot_of(buffer, offset, index);
+    };
+    {
+      const RecordedCommandCounter counter;
+      context.PrepareBda();
+      Require(name, "one barrier pair",
+              RecordedCommandCounter::barriers == 2 && RecordedCommandCounter::copies == 1,
+              "two ranges of one buffer did not upload in one copy behind one barrier pair");
+    }
     Require(name, "mapped intersection",
             !cache.IsRegionCpuModified(base, page) &&
                 cache.IsRegionCpuModified(base + page, page) &&
@@ -6708,6 +6747,21 @@ public:
             "BDA upload missed a mapped range or uploaded an unmapped hole");
     snapshot(0, 0);
     snapshot(2 * page, 1);
+
+    // A write queues a page only once a DMA access reported it; the report queues it too.
+    cache.InvalidateMemory(base + 17, 1);
+    context.PrepareBda();
+    Require(name, "unaccessed write", cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
+            "a write queued a page no DMA shader accessed");
+    cache.GetFaultBuffer()->Fill(BufferCache::PageIndex(base) / 32 * 4, 4,
+                                 1u << (BufferCache::PageIndex(base) % 32));
+    cache.ProcessFaultBuffer();
+    scheduler.Finish();
+    context.PrepareBda();
+    Require(name, "accessed page", !cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
+            "a DMA access report did not queue its page");
+    const auto tagged_entry = static_cast<u32>(buffer.BufferDeviceAddress() | BufferCache::BDA_ACCESSED);
+    snapshot_of(*cache.GetBdaPageTableBuffer(), BufferCache::PageIndex(base) * sizeof(uint64_t), 8);
 
     cache.InvalidateMemory(base + 17, 1);
     words[4] = 0x87654321u;
@@ -6755,10 +6809,23 @@ public:
     cache.RunGarbageCollector(nullptr);
     Require(name, "clean eviction", !cache.IsRegionRegistered(base, 3 * page),
             "garbage collection kept the clean buffer");
-    (void)cache.FindBuffer(base, 3 * page);
-    context.PrepareBda();
+    const auto low = cache.FindBuffer(base, page);
+    const auto high = cache.FindBuffer(base + page, 2 * page);
+    {
+      const RecordedCommandCounter counter;
+      context.PrepareBda();
+      Require(name, "shared barrier pair",
+              RecordedCommandCounter::barriers == 2 && RecordedCommandCounter::copies == 2,
+              "two buffers did not upload behind one barrier pair");
+    }
     Require(name, "replacement upload", !cache.IsRegionCpuModified(base, 3 * page),
-            "a buffer replacing an evicted one did not upload its untracked pages");
+            "buffers replacing an evicted one did not upload their untracked pages");
+    snapshot_of(cache.GetBuffer(low), 16, 6);
+    snapshot_of(cache.GetBuffer(high), page, 7);
+    // Registration re-tags only the accessed page.
+    snapshot_of(*cache.GetBdaPageTableBuffer(), BufferCache::PageIndex(base) * sizeof(uint64_t), 9);
+    snapshot_of(*cache.GetBdaPageTableBuffer(),
+                BufferCache::PageIndex(base + page) * sizeof(uint64_t), 10);
 
     vk::BufferMemoryBarrier barrier{};
     barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -6769,10 +6836,13 @@ public:
     scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
         vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
     scheduler.Finish();
-    Require(name, "GPU contents", ReadBuffer(name, readback, 6) ==
+    Require(name, "GPU contents", ReadBuffer(name, readback, 11) ==
         std::vector<u32>{0x12345678u, 0x12345678u, 0x87654321u, 0xabcdef01u,
-                        0x12345678u, 0xfedcba98u},
-        "initial, re-dirtied, newly mapped or remapped bytes were stale on the GPU");
+                        0x12345678u, 0xfedcba98u, 0x87654321u, 0xfedcba98u, tagged_entry,
+                        static_cast<u32>(cache.GetBuffer(low).BufferDeviceAddress() |
+                                         BufferCache::BDA_ACCESSED),
+                        static_cast<u32>(cache.GetBuffer(high).BufferDeviceAddress())},
+        "stale bytes on the GPU, or page-table entries with wrong accessed tags");
     context.UnmapMemory(base, 3 * page);
     scheduler.Finish();
     DestroyBuffer(&readback);
@@ -7059,8 +7129,15 @@ public:
           TextureCacheTestAccess::InsertImage(texture_cache, spanning_info);
       const auto spanning_results = TextureCacheTestAccess::FindImages(
           texture_cache, spanning_info.data.address, spanning_info.data.size);
+      // Regions starting in the image's second page and before its first.
+      const auto spanning_tail = TextureCacheTestAccess::FindImages(
+          texture_cache, spanning_info.data.End() - 1, 1);
+      const auto spanning_cover = TextureCacheTestAccess::FindImages(
+          texture_cache, spanning_info.data.address - 0x100000, 0x300000);
       Require(name, "one-MiB cross-page deduplication",
               spanning && IsOnlyImage(spanning_results, spanning) &&
+                  IsOnlyImage(spanning_tail, spanning) &&
+                  IsOnlyImage(spanning_cover, spanning) &&
                   TextureCacheTestAccess::PageOwnerCount(
                       texture_cache, spanning_info.data.address) == 1 &&
                   TextureCacheTestAccess::PageOwnerCount(
@@ -7124,7 +7201,6 @@ public:
                   texture_cache, large_info.data.address, large_info.data.size,
                   large_owner) == 0,
               "large image unregister left coarse memberships behind");
-
 
       auto &image = texture_cache.GetImage(first);
       constexpr uint32_t final_sampled_value = 0x88776655u;
@@ -8493,6 +8569,17 @@ public:
                       ms_depth_image,
               "CPU invalidation left a reused stencil image write-protected");
       memory[second_stencil_offset] = 0x5a;
+
+      // Another image at the plane's range is not adopted while the depth
+      // keeps its own plane record.
+      const auto other_image = TextureCacheTestAccess::InsertImage(
+          texture_cache, stencil_storage_desc.info);
+      TextureCacheTestAccess::AssociateStencil(
+          texture_cache, switched_ms_depth_id, switched_ms_depth.info.stencil);
+      Require(name, "stencil re-association keeps its plane record",
+              !texture_cache.GetImage(other_image).depth_id,
+              "re-association adopted another image at the stencil range");
+      TextureCacheTestAccess::DeleteImage(texture_cache, other_image);
 
       constexpr uint64_t added_stencil_depth_offset = 0x60000;
       constexpr uint64_t added_stencil_offset = 0x70000;
@@ -17565,12 +17652,13 @@ public:
       phased_depth_control.z_write_enable = true;
       registers.SetDepthControl(phased_depth_control);
       registers.SetRenderControl({});
-      RenderDepthInfo disabled_depth{};
+      // The executor reuses one depth slot, so a draw without depth state must clear it.
+      RenderDepthInfo disabled_depth{.depth_test_enable = true, .image_id = disjoint_depth_id};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
           executor, scheduler.Current(), disabled_depth);
       Require(name, "disabled tests with stale depth write enable",
-              !disabled_depth.image_id,
-              "a dormant depth write bit bound a depth attachment");
+              !disabled_depth.image_id && !disabled_depth.depth_test_enable,
+              "a dormant depth write bit bound an attachment or kept the old slot");
       phased_depth_control.z_enable = true;
       registers.SetDepthControl(phased_depth_control);
       HW::RenderControl phased_render_control{};
@@ -20059,7 +20147,7 @@ public:
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
                           1, barriers.data(), 0, nullptr);
-      for (const auto &[guest_base, backing] : test.bda_mappings) {
+      for (const auto &[guest_base, backing, accessed] : test.bda_mappings) {
         const auto page_offset = guest_base &
                                  (BufferCache::CACHING_PAGESIZE - 1);
         Require(test.name, "dispatch",
@@ -20069,7 +20157,8 @@ public:
         const auto pages =
             (bytes + BufferCache::CACHING_PAGESIZE - 1) /
             BufferCache::CACHING_PAGESIZE;
-        auto address = buffer.device_address + backing - page_offset;
+        auto address = buffer.device_address + backing - page_offset +
+                       (accessed ? BufferCache::BDA_ACCESSED : 0);
         auto page = BufferCache::PageIndex(guest_base);
         for (uint64_t mapped = 0; mapped < pages; mapped++) {
           cmd.updateBuffer(m_bda_pagetable_buffer.buffer,
@@ -20127,7 +20216,15 @@ public:
                           &barrier, 0, nullptr);
     }
     Buffer fault_result;
-    if (test.fault_free_address) {
+    auto fault_address = test.fault_free_address;
+    u32 expected_fault = 0;
+    for (const auto &mapping : test.bda_mappings) {
+      if (!mapping.accessed) {
+        fault_address = mapping.guest_base;
+        expected_fault = 1u << (BufferCache::PageIndex(mapping.guest_base) & 31u);
+      }
+    }
+    if (fault_address) {
       Require(test.name, "fault check", uses_bda, "fault check requires BDA");
       fault_result = CreateHostBuffer(test.name, sizeof(u32),
                                      vk::BufferUsageFlagBits::eTransferDst, {});
@@ -20136,7 +20233,7 @@ public:
           .dstAccessMask = vk::AccessFlagBits::eTransferRead};
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 1, &ready, 0, nullptr, 0, nullptr);
-      const vk::BufferCopy region{(BufferCache::PageIndex(*test.fault_free_address) >> 5u) * sizeof(u32),
+      const vk::BufferCopy region{(BufferCache::PageIndex(*fault_address) >> 5u) * sizeof(u32),
                                    0, sizeof(u32)};
       cmd.copyBuffer(m_fault_buffer.buffer, fault_result.buffer, 1, &region);
       const vk::MemoryBarrier readable{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
@@ -20145,9 +20242,9 @@ public:
                           {}, 1, &readable, 0, nullptr, 0, nullptr);
     }
     EndSubmitAndFree(test.name, "dispatch", cmd);
-    if (test.fault_free_address) {
-      Require(test.name, "fault check", ReadBuffer(test.name, fault_result, 1)[0] == 0u,
-              "suppressed formatted access touched an unmapped page");
+    if (fault_address) {
+      Require(test.name, "fault check", ReadBuffer(test.name, fault_result, 1)[0] == expected_fault,
+              "an access recorded a suppressed or accessed page, or missed an unaccessed one");
       DestroyBuffer(&fault_result);
     }
     for (const auto view : sampled_mip_views) {
@@ -20366,10 +20463,10 @@ public:
       mode.polymode_back_ptype = back;
       mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
-      DrawRenderState state{.depth_info = depth, .color_info = {color}, .color_count = 1,
-                            .topology = topology, .ps_active = true,
+      DrawRenderState state{.topology = topology, .ps_active = true,
                             .vertex_info = {vertex}, .ps_input_info = pixel};
-      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
+      const DrawTargets targets{.depth = depth, .colors = {color}, .color_count = 1};
+      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state, targets);
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected,
@@ -21347,6 +21444,9 @@ public:
                   "native vertex or instance offset was applied twice");
         }
       }
+      Require("NativeIndirectDrawOffsets", "color slots per draw",
+              RenderExecutorTestAccess::ColorTargetCount(executor) == 1,
+              "a draw kept the previous draw's color targets");
       // With back faces culled, the triangle draws for exactly one winding.
       const auto draws_with_back_cull = [&](bool clockwise) {
         registers.SetModeControl({.cull_back = true, .face = clockwise});
@@ -39133,6 +39233,14 @@ TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
   return test;
 }
 
+// A load from a page without the accessed tag reads it and records a fault.
+TestCase GlobalLoadRecordsUnaccessedPage() {
+  auto test = GlobalSignedImmediateRebasesBeforeSaddr();
+  test.name = "GlobalLoadRecordsUnaccessedPage";
+  test.bda_mappings.front().accessed = false;
+  return test;
+}
+
 TestCase FlatSegmentIgnoresSaddrAndMasksOffsetMsb() {
   using O = ShaderOpcode;
 
@@ -49127,6 +49235,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(FlatLoadShortD16HiIntoAddressHighVgpr(64));
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
+  AddCase(GlobalLoadRecordsUnaccessedPage);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
   AddCase(ScratchIsPrivatePerInvocation);
   cases.push_back(FlatStackApertures(32));
@@ -49617,7 +49726,7 @@ void CheckShaderStore(VulkanHarness &vulkan) {
       auto &scheduler = context.GetCommandScheduler();
       DrawRenderState state{.topology = vk::PrimitiveTopology::eTriangleList};
       pipelines.GetGraphicsPrograms(scheduler.Current(), state);
-      (void)pipelines.GetGraphicsPipeline(scheduler.Current(), state);
+      (void)pipelines.GetGraphicsPipeline(scheduler.Current(), state, {});
       context.GetBufferCache().ReadMemory(base, sizeof(u32));
       (void)LibKernel::Memory::TryReadBacking(base, &session.output, sizeof(u32));
       context.UnmapMemory(base, allocation_size);
@@ -51492,6 +51601,29 @@ void CheckDepthTextureEncoding() {
               IsSupportedDepthTextureEncoding(compressed_mip_stats_counter),
           "depth descriptor rejected its mip-stats counter id");
 
+  // Demon's Souls samples an uncompressed depth target whose T# keeps DCC
+  // settings with compression off.
+  const ShaderTextureResource dcc_settings{{
+      0x029b8100u,
+      0xc1600000u,
+      0x00b3c13fu,
+      0x91800924u,
+      0x00000000u,
+      0x00700000u,
+      0x77c00000u,
+      0x00000003u,
+  }};
+  // Every other setting a clear COMPRESSION_EN disables.
+  auto all_dcc_settings = disabled_metadata;
+  all_dcc_settings.fields[6] |= 0x00df8000u;
+  auto msaa_depth_flag = uncompressed_msaa;
+  msaa_depth_flag.fields[6] |= 1u << 10u;
+  Require("DepthTextureEncoding", "metadata settings without compression",
+          IsSupportedDepthTextureEncoding(dcc_settings) &&
+              IsSupportedDepthTextureEncoding(all_dcc_settings) &&
+              IsSupportedDepthTextureEncoding(msaa_depth_flag),
+          "uncompressed depth rejected inactive metadata settings");
+
   const ShaderTextureResource first_use_depth{{
       0x0225fc00u, 0x01600000u, 0x00000000u, 0x91800924u,
       0x00000000u, 0x00700000u, 0x80280000u, 0x000225fdu,
@@ -51511,16 +51643,13 @@ void CheckDepthTextureEncoding() {
   dcc_only_control.fields[6] |= 1u << 22u;
   auto non_msaa_iterate_256 = compressed_descriptor;
   non_msaa_iterate_256.fields[6] |= 1u << 10u;
-  auto uncompressed_dcc_control = pipe_aligned_metadata;
-  uncompressed_dcc_control.fields[6] |= 1u << 22u;
   Require(
       "DepthTextureEncoding", "invalid HTILE encoding",
       !IsSupportedDepthTextureEncoding(missing_metadata) &&
           !IsSupportedDepthTextureEncoding(out_of_range_metadata) &&
           !IsSupportedDepthTextureEncoding(unaligned_metadata) &&
           !IsSupportedDepthTextureEncoding(dcc_only_control) &&
-          !IsSupportedDepthTextureEncoding(non_msaa_iterate_256) &&
-          !IsSupportedDepthTextureEncoding(uncompressed_dcc_control),
+          !IsSupportedDepthTextureEncoding(non_msaa_iterate_256),
       "compressed sampled depth accepted an unsupported address or control");
 
   std::printf("[host]    %-32s ok\n", "DepthTextureEncoding");
@@ -54805,6 +54934,44 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
   check_offsets(auto_packet, gs, {41, 7, 8}, "GPU records");
   indexed_packet[3] |= 1u << 28u;
   check_offsets(indexed_packet, gs, {17, 19, 61}, "first-index destination");
+
+  // Packets that differ only in data offsets, each drawing the record after the
+  // previous one, draw as one multi-draw; the SGPRs end as the last record's.
+  arguments = {0, 1, 2, 3, 4, 0, 1, 5, 6, 7, 0, 1, 8, 9, 10, 0, 1, 11, 12, 13};
+  std::array<uint32_t, 20> run{};
+  for (uint32_t i = 0; i < 4; i++) {
+    std::copy(indexed_packet.begin(), indexed_packet.end(),
+              run.begin() + i * 5);
+    run[i * 5 + 1] = i * 20;
+  }
+  const auto drawn = [&](std::array<uint32_t, 20> commands, uint32_t dw = 20) {
+    const auto payload_dw =
+        CpOpDrawIndirect(processor, commands[0], commands.data() + 1, dw, dw);
+    return payload_dw / 5 + 1;
+  };
+  Require("Pm4DrawIndirectMulti", "contiguous run",
+          drawn(run) == 4 &&
+              std::equal(gs + 9, gs + 12, std::array{12u, 13u, 11u}.begin()) &&
+              drawn(run, 19) == 3,
+          "a run of indirect draws was not drawn as one multi-draw");
+  auto predicated = run;
+  predicated[10] |= 1u;
+  auto other_initiator = run;
+  other_initiator[9] = 0x20;
+  auto overlapping = run;
+  overlapping[6] = 16;
+  auto gap = run;
+  gap[11] = 44;
+  // The next record past a 32-bit data offset of 0xffffffec is not at offset 0.
+  auto wrapped = run;
+  wrapped[1] = 0xffffffecu;
+  wrapped[6] = 0;
+  const bool ended = drawn(predicated) == 2 && drawn(other_initiator) == 1 &&
+                     drawn(overlapping) == 1 && drawn(gap) == 2;
+  processor.SetDrawIndirectArgsBaseAddress(
+      reinterpret_cast<uint64_t>(arguments.data()) - 0xffffffecu);
+  Require("Pm4DrawIndirectMulti", "run end", ended && drawn(wrapped) == 1,
+          "an indirect draw run took a packet that draws differently");
   processor.BufferFlush();
   std::printf("[host]    %-32s ok\n", "Pm4DrawIndirectMulti");
 }
@@ -55437,6 +55604,79 @@ void CheckPm4Flip() {
           "undelivered vblanks were queued as separate events");
 
   gpu.WaitForIdle();
+  Require(name, "close", VideoOut::VideoOutClose(handle) == 0,
+          "video-out close failed");
+  EventQueue::KernelDeleteEqueue(flips);
+  renderer.ShutdownGpu();
+  VideoOut::VideoOutShutdown();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// A flip rate is the shortest flip interval, counted from the last flip.
+void CheckFlipRate() {
+  namespace EventQueue = LibKernel::EventQueue;
+  using Common::DebugCounters::Counter;
+  constexpr const char *name = "FlipRate";
+  constexpr std::chrono::duration<double> period{1.0 / 30};
+  Config::Load({.vblank_frequency = 30,
+                .printf_direction = Config::LogDirection::Silent});
+  Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO),
+          "SDL video init failed");
+  WindowContext window;
+  window.graphic_ctx.screen_width = 64;
+  window.graphic_ctx.screen_height = 64;
+  window.window =
+      SDL_CreateWindow(name, 64, 64, SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+  Require(name, "window", window.window != nullptr,
+          "hidden Vulkan window failed");
+  window.CreateVulkan();
+  auto &video_out = VideoOut::VideoOutInit(64, 64, *window.presenter);
+  auto &renderer = *window.render_context;
+  renderer.InitializeGpu(&video_out);
+
+  const int handle = VideoOut::VideoOutOpen(255, 0, 0, nullptr);
+  EventQueue::KernelEqueue flips = EventQueue::KERNEL_EQUEUE_INVALID;
+  Require(name, "setup",
+          handle > 0 && EventQueue::KernelCreateEqueue(&flips, "flips") == 0 &&
+              VideoOut::VideoOutAddFlipEvent(flips, handle, nullptr) == 0 &&
+              VideoOut::VideoOutSetFlipRate(handle, 1) == 0,
+          "video-out setup failed");
+  const auto flip = [&] {
+    EventQueue::KernelEvent event{};
+    int count = 0;
+    LibKernel::KernelUseconds timeout = 2'000'000;
+    Require(name, "flip",
+            VideoOut::VideoOutSubmitFlip(handle, -1, 1, 0) == 0 &&
+                EventQueue::KernelWaitEqueue(flips, &event, 1, &count,
+                                             &timeout) == 0 &&
+                count == 1,
+            "the flip did not complete");
+    return std::chrono::steady_clock::now();
+  };
+
+  // At rate 1 a frame submitted after its slot flips at the next vblank, 3
+  // vblanks after the last flip, and the frame after it waits 2 vblanks again.
+  // The first present of the port is slow, so the timed flips follow a warm-up
+  // and one idle vblank that settles its lateness count.
+  Common::DebugCounters::SetEnabled(true);
+  flip();
+  std::this_thread::sleep_for(period);
+  const auto late_vblanks = Common::DebugCounters::Get(Counter::LateVblanks);
+  const auto first = flip();
+  std::this_thread::sleep_until(first + period * 2.4);
+  const auto late = flip();
+  const auto next = flip();
+  Require(name, "pacing",
+          Common::DebugCounters::Get(Counter::LateVblanks) == late_vblanks,
+          "the present thread fell behind the vblank rate");
+  Common::DebugCounters::SetEnabled(false);
+  const double next_gap = (next - late) / period;
+  Require(name, "late flip", (late - first) / period < 3.5,
+          "a late frame did not flip at the next vblank");
+  Require(name, "interval", next_gap > 1.5 && next_gap < 2.5,
+          "the frame after a late flip did not wait 2 vblanks");
+
+  renderer.GetGpu().WaitForIdle();
   Require(name, "close", VideoOut::VideoOutClose(handle) == 0,
           "video-out close failed");
   EventQueue::KernelDeleteEqueue(flips);
@@ -56329,6 +56569,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, FlatSubdwordLoadsApplyByteOffset());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
     RunCase(&vulkan, GlobalSignedImmediateRebasesBeforeSaddr());
+    RunCase(&vulkan, GlobalLoadRecordsUnaccessedPage());
     RunCase(&vulkan, FlatSegmentIgnoresSaddrAndMasksOffsetMsb());
     RunCase(&vulkan, ScratchIsPrivatePerInvocation());
     return 0;
@@ -56633,6 +56874,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {
     CheckPm4Flip();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--flip-rate-only") == 0) {
+    CheckFlipRate();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--device-creation-only") == 0) {

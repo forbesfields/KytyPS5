@@ -117,6 +117,14 @@ bool Ps5ProEnabled() {
 	return g_config->pro_enabled;
 }
 
+const std::filesystem::path& GetDlssFolder() {
+	return g_config->dlss_folder;
+}
+
+uint32_t GetDlssPreset() {
+	return g_config->dlss_preset;
+}
+
 bool AmdCpuEnabled() {
 	return g_config->amd_cpu_enabled;
 }
@@ -211,6 +219,10 @@ bool ReadbackStorageImagesEnabled() {
 
 bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
+}
+
+uint32_t GetFlushDraws() {
+	return g_config->flush_draws;
 }
 
 bool TessellationEnabled() {

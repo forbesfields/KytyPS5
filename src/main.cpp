@@ -52,8 +52,11 @@ static void PrintUsage() {
 	    "  --stretch                            Stretch the image to the window. Default: off.\n");
 	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
-	::printf("  --trinity                            Enable experimental PS5 Pro mode for supported titles\n"
-	         "                                       (PSSR uses linear scaling). Default: off.\n");
+	::printf("  --trinity                            Enable experimental PS5 Pro mode for\n"
+	         "                                       supported titles. Default: off.\n");
+	::printf("  --dlss <folder>                      With --trinity, upscale PSSR with the DLSS\n"
+	         "                                       model in <folder> instead of linearly.\n");
+	::printf("  --dlss-preset <A-O>                  DLSS preset. Default: the model's own.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
@@ -82,6 +85,8 @@ static void PrintUsage() {
 	::printf("  --readback-tiled-images              Read back small writable tiled images on submit.\n");
 	::printf("  --readback-storage-images            Read back storage images on GL2 writeback.\n");
 	::printf("  --sync-raw-image-buffers             Synchronize raw reads of GPU images.\n");
+	::printf(
+	    "  --flush-draws <num>                  Submit GPU work every <num> draws; 0 is off.\n");
 	::printf("  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
@@ -365,6 +370,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid present mode: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--dlss") {
+			options.config.dlss_folder = Common::PathFromUtf8(value);
+		} else if (arg == "--dlss-preset") {
+			if (value.size() != 1 || value[0] < 'A' || value[0] > 'O') {
+				::printf("invalid DLSS preset: %s\n", value.c_str());
+				return false;
+			}
+			options.config.dlss_preset = static_cast<uint32_t>(value[0] - 'A' + 1);
 		} else if (arg == "--gpu") {
 			if (!ParseInt32(value, options.config.gpu_index)) {
 				::printf("invalid gpu index: %s\n", value.c_str());
@@ -373,6 +386,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--vblank-frequency") {
 			if (!ParseUint32(value, options.config.vblank_frequency)) {
 				::printf("invalid vblank frequency: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--flush-draws") {
+			if (!ParseUint32(value, options.config.flush_draws)) {
+				::printf("invalid draw count: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--trophy-duration") {
