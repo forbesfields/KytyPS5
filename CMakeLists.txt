@@ -578,6 +578,12 @@ add_executable(jpeg_enc_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/JpegEncTests.c
 target_link_libraries(jpeg_enc_tests common fmt::fmt)
 target_include_directories(jpeg_enc_tests PRIVATE ${inc_headers})
 
+add_executable(rendering_scope_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/RenderingScopeTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/context.cpp")
+target_link_libraries(rendering_scope_tests common fmt::fmt Vulkan::Headers ${CMAKE_DL_LIBS})
+target_include_directories(rendering_scope_tests PRIVATE ${inc_headers})
+
 add_executable(occlusion_queries_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/OcclusionQueriesTests.cpp")
 target_link_libraries(occlusion_queries_tests common fmt::fmt Vulkan::Headers)
@@ -784,6 +790,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mul-hi24-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
+	add_test(NAME rendering_scope COMMAND $<TARGET_FILE:rendering_scope_tests>)
+	add_test(NAME rendering_scope_gpu COMMAND $<TARGET_FILE:rendering_scope_tests> --gpu)
+	set_tests_properties(rendering_scope_gpu PROPERTIES SKIP_RETURN_CODE 77)
 	add_test(NAME graphics_pipeline_rasterization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets

@@ -90,6 +90,19 @@ struct SubmitInfo {
 	}
 };
 
+// The rendering scope has no scheduler state. Tests can record its native commands directly.
+class RenderingScope {
+public:
+	void Begin(vk::CommandBuffer command, const RenderState& state, bool merge_passes,
+	           bool attachment_ops);
+	void End(vk::CommandBuffer command);
+	[[nodiscard]] bool Active() const noexcept { return m_active; }
+
+private:
+	RenderState m_state;
+	bool        m_active = false;
+};
+
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
@@ -119,14 +132,13 @@ private:
 	void Begin();
 	void End() const;
 
-	RenderContext&      m_context;
-	GraphicContext&     m_graphics;
-	vk::CommandBuffer   m_buffer = nullptr;
-	mutable RenderState m_render_state;
-	mutable bool        m_rendering   = false;
-	HW::Context*        m_registers   = nullptr;
-	HW::UserConfig*     m_user_config = nullptr;
-	HW::Shader*         m_shaders     = nullptr;
+	RenderContext&         m_context;
+	GraphicContext&        m_graphics;
+	vk::CommandBuffer      m_buffer = nullptr;
+	mutable RenderingScope m_rendering;
+	HW::Context*           m_registers   = nullptr;
+	HW::UserConfig*        m_user_config = nullptr;
+	HW::Shader*            m_shaders     = nullptr;
 
 	friend class CommandScheduler;
 };

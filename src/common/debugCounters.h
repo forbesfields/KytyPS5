@@ -17,6 +17,13 @@ enum class Counter {
 	DrawInstances,
 	IndirectDraws,
 	Dispatches,
+	RenderPassStarts, // Native beginRendering commands; includes emulated mesh restarts.
+	ComputePasses,    // Native guest compute dispatch commands; excludes driver tessellation.
+	BufferBlits,      // Recorded buffer copies, not driver Metal encoder counts.
+	BufferFills,      // MoltenVK can encode fills as compute instead of blits.
+	RenderPassMerges,
+	InPassClears,
+	AttachmentStoresSkipped,
 	QueueSubmits,
 	GpuWaits, // CPU blocked on a GPU timeline semaphore.
 	GpuWaitNs,

@@ -99,6 +99,7 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 		command.pipelineBarrier2(dependency);
 		const vk::BufferCopy copy {offset, destination_offset, chunk};
 		command.copyBuffer(m_staging_buffer.Handle(), buffer.Handle(), 1, &copy);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferBlits);
 		auto after          = before;
 		after.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
 		after.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
@@ -222,6 +223,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       nullptr);
 	native.copyBuffer(buffer.Handle(), download.buffer->Handle(),
 	                  static_cast<uint32_t>(copies.size()), copies.data());
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferBlits);
 
 	auto after          = before;
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -506,6 +508,7 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 	for (const auto& upload: uploads) {
 		native.copyBuffer(source.first->Handle(), upload.buffer->Handle(),
 		                  static_cast<uint32_t>(upload.end - first), copies.data() + first);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferBlits);
 		first = upload.end;
 	}
 	const vk::MemoryBarrier after {.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
