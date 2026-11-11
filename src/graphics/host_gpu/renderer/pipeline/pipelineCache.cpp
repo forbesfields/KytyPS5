@@ -404,6 +404,13 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
+	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+		if (options.stage == ShaderType::Mesh && input_info.mesh.emulated &&
+		    MeshEmulationHeaderDword(input_info.user_clip_planes) != ShaderRecompiler::IR::PushData::NoStart) {
+			// Spilled shader data has the same push cursor in both modes. Keep its modules apart.
+			m_lookup_key.static_state.push_back(0x4d424154u); // MBAT
+		}
+	}
 	auto entry = m_program_cache.find(m_lookup_key);
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
@@ -482,6 +489,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
     : m_graphics(graphics), m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	(void)MeshEmulationBatchEnabled();
 	InitializeDriverCache();
 	WarmUp(shader_store);
 }
@@ -894,6 +902,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
+	if (mesh_active && vertex_info[0].mesh.emulated &&
+	    MeshEmulationHeaderDword(last_stage.user_clip_planes) != ShaderRecompiler::IR::PushData::NoStart)
+		push_data_cursor += MeshEmulationLayout::HeaderDwords;
 	if (pixel_active) {
 		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
 		for (const auto& output: pixel_module.info.info.outputs) {

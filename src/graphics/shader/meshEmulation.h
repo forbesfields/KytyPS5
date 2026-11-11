@@ -13,6 +13,19 @@ inline constexpr uint32_t MeshEmulationBinding = 255u;
 static_assert(MeshEmulationBinding >= 4u *
     static_cast<uint32_t>(ShaderRecompiler::IR::DescriptorBindingKind::Count));
 
+// The switch is read and logged once. A full push layout reads its header from storage.
+[[nodiscard]] bool MeshEmulationBatchEnabled();
+[[nodiscard]] uint32_t MeshEmulationHeaderDword(uint32_t user_clip_planes);
+
+struct MeshEmulationBatch {
+    uint32_t groups = 0;
+    uint32_t instances = 0;
+};
+
+[[nodiscard]] MeshEmulationBatch PlanMeshEmulationBatch(
+    uint32_t groups, uint32_t instances, uint64_t capacity,
+    uint32_t max_groups, uint32_t max_instances);
+
 struct MeshEmulationField {
     ShaderRecompiler::IR::StageOutput output;
     uint32_t offset = 0;

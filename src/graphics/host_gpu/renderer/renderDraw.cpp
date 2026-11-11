@@ -1181,6 +1181,13 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	const auto rendering = AcquireRenderTargets(buffer, m_targets.colors, m_targets.color_count,
 	                                            m_targets.depth, feedback_aspects, stages);
 	uint32_t emulated_group_limit = 0u;
+	uint32_t emulated_instance_limit = 1u;
+	bool emulated_batching = emulated_mesh && MeshEmulationBatchEnabled();
+	const auto emulated_header = emulated_mesh
+	    ? MeshEmulationHeaderDword(vertex_stages.back().user_clip_planes)
+	    : ShaderRecompiler::IR::PushData::NoStart;
+	vk::Buffer emulated_header_buffer;
+	uint64_t emulated_header_offset = 0u;
 	if (emulated_mesh) {
 		const auto& layout = state.vertex_info[0].stage.module->mesh_layout;
 		auto& storage = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::DeviceLocal);
@@ -1193,8 +1200,39 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		    (limit - header_bytes) / group_bytes, compute_limits.maxComputeWorkGroupCount[0]));
 		emulated_group_limit = std::min(emulated_group_limit, UINT32_MAX / (layout.max_primitives * 3u));
 		EXIT_IF(emulated_group_limit == 0u);
+		if (emulated_batching) {
+			const auto batch = PlanMeshEmulationBatch(mesh_groups, draw.instance_count,
+			    (limit - header_bytes) / group_bytes, emulated_group_limit,
+			    compute_limits.maxComputeWorkGroupCount[1]);
+			emulated_group_limit = batch.groups;
+			emulated_instance_limit = batch.instances;
+			if (emulated_header == ShaderRecompiler::IR::PushData::NoStart) {
+				// Full clip-plane layouts leave no push space. Upload all headers before recording.
+				auto& stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+				const auto chunks = uint64_t{(mesh_groups - 1u) / batch.groups + 1u} *
+				    ((draw.instance_count - 1u) / batch.instances + 1u);
+				if (chunks <= stream.Size() / header_bytes) {
+					std::vector<std::array<uint32_t, MeshEmulationLayout::HeaderDwords>> headers;
+					headers.reserve(static_cast<size_t>(chunks));
+					for (uint32_t instance = 0; instance < draw.instance_count;) {
+						for (uint32_t first = 0; first < mesh_groups;) {
+							headers.push_back({first, instance, mesh_groups, draw.instance_count});
+							first += std::min(mesh_groups - first, batch.groups);
+						}
+						instance += std::min(draw.instance_count - instance, batch.instances);
+					}
+					emulated_header_buffer = stream.Handle();
+					emulated_header_offset = stream.Copy(headers.data(), chunks * header_bytes, 4u);
+				} else {
+					// A draw larger than the upload ring keeps the bounded legacy loop.
+					emulated_batching = false;
+					emulated_instance_limit = 1u;
+				}
+			}
+		}
 		bindings.vertex[0].mesh_output = {storage.Handle(), 0u,
-		    header_bytes + group_bytes * std::min(mesh_groups, emulated_group_limit)};
+		    header_bytes + group_bytes * std::min(mesh_groups, emulated_group_limit) *
+		        emulated_instance_limit};
 	}
 	vk::DeviceAddress task_params = 0;
 	if (mesh_task) {
@@ -1234,7 +1272,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		                    !state.ps_input_info.stage.module->triangle_parameters.empty();
 		if (emulated_mesh) {
 			const auto chunks = (mesh_groups - 1u) / emulated_group_limit + 1u;
-			work.host_passes  = uint64_t {draw.instance_count} * chunks;
+			work.host_passes  = uint64_t {(draw.instance_count - 1u) / emulated_instance_limit + 1u} * chunks;
 			work.elements     = uint64_t {std::min(mesh_groups, emulated_group_limit)} *
 			                    mesh.max_primitives * 3u;
 		}
@@ -1308,35 +1346,78 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		EXIT_IF(pipeline.mesh_compute_pipeline == nullptr || mesh_task);
 		auto& storage = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::DeviceLocal);
 		auto& queries = m_context.GetOcclusionQueries();
-		for (uint32_t instance = 0; instance < draw.instance_count; ++instance) {
-			for (uint32_t first_group = 0; first_group < mesh_groups;) {
-				const auto count = std::min(mesh_groups - first_group, emulated_group_limit);
-				buffer.EndRendering();
-				// The scratch region is reused only after all preceding shader accesses finish.
-				const vk::MemoryBarrier to_header{
-				    .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-				    .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
-				vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-				    vk::PipelineStageFlagBits::eTransfer, {}, 1u, &to_header, 0u, nullptr, 0u, nullptr);
-				const std::array<uint32_t, MeshEmulationLayout::HeaderDwords> header{
-				    first_group, instance, mesh_groups, draw.instance_count};
-				vk_buffer.updateBuffer(storage.Handle(), 0u, sizeof(header), header.data());
-				ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-				vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.mesh_compute_pipeline);
-				vk_buffer.dispatch(count, 1u, 1u);
-				ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-				buffer.BeginRendering(rendering);
-				vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
-				const auto query = queries.Begin(vk_buffer);
-				vk_buffer.draw(count * mesh.max_primitives * 3u, 1u, 0u, 0u);
-				if (tessellation) {
-					m_context.RecordTessellationDraw(count * mesh.max_primitives * 3u, 1u);
+		if (emulated_batching) {
+			for (uint32_t instance = 0; instance < draw.instance_count;) {
+				const auto instances = std::min(draw.instance_count - instance, emulated_instance_limit);
+				for (uint32_t first_group = 0; first_group < mesh_groups;) {
+					const auto count = std::min(mesh_groups - first_group, emulated_group_limit);
+					buffer.EndRendering();
+					const std::array<uint32_t, MeshEmulationLayout::HeaderDwords> header{
+					    first_group, instance, mesh_groups, draw.instance_count};
+					if (emulated_header != PushData::NoStart) {
+						vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
+						    emulated_header * sizeof(uint32_t), sizeof(header), header.data());
+					} else {
+						const vk::MemoryBarrier to_header{
+						    .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+						    .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
+						vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+						    vk::PipelineStageFlagBits::eTransfer, {}, 1u, &to_header, 0u, nullptr, 0u, nullptr);
+						const vk::BufferCopy copy{emulated_header_offset, 0u, sizeof(header)};
+						vk_buffer.copyBuffer(emulated_header_buffer, storage.Handle(), 1u, &copy);
+						emulated_header_offset += sizeof(header);
+					}
+					// Wait for earlier reads and header copies before reusing the scratch records.
+					ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+					vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.mesh_compute_pipeline);
+					vk_buffer.dispatch(count, instances, 1u);
+					ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+					buffer.BeginRendering(rendering);
+					vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+					const auto query = queries.Begin(vk_buffer);
+					vk_buffer.draw(count * mesh.max_primitives * 3u, instances, 0u, 0u);
+					if (tessellation) {
+						m_context.RecordTessellationDraw(count * mesh.max_primitives * 3u, instances);
+					}
+					queries.End(vk_buffer, query);
+					buffer.EndRendering();
+					if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage))
+						ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eFragmentShader);
+					first_group += count;
 				}
-				queries.End(vk_buffer, query);
-				buffer.EndRendering();
-				if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage))
-					ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eFragmentShader);
-				first_group += count;
+				instance += instances;
+			}
+		} else {
+			for (uint32_t instance = 0; instance < draw.instance_count; ++instance) {
+				for (uint32_t first_group = 0; first_group < mesh_groups;) {
+					const auto count = std::min(mesh_groups - first_group, emulated_group_limit);
+					buffer.EndRendering();
+					// The scratch region is reused only after all preceding shader accesses finish.
+					const vk::MemoryBarrier to_header{
+					    .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+					    .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
+					vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+					    vk::PipelineStageFlagBits::eTransfer, {}, 1u, &to_header, 0u, nullptr, 0u, nullptr);
+					const std::array<uint32_t, MeshEmulationLayout::HeaderDwords> header{
+					    first_group, instance, mesh_groups, draw.instance_count};
+					vk_buffer.updateBuffer(storage.Handle(), 0u, sizeof(header), header.data());
+					ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+					vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.mesh_compute_pipeline);
+					vk_buffer.dispatch(count, 1u, 1u);
+					ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+					buffer.BeginRendering(rendering);
+					vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+					const auto query = queries.Begin(vk_buffer);
+					vk_buffer.draw(count * mesh.max_primitives * 3u, 1u, 0u, 0u);
+					if (tessellation) {
+						m_context.RecordTessellationDraw(count * mesh.max_primitives * 3u, 1u);
+					}
+					queries.End(vk_buffer, query);
+					buffer.EndRendering();
+					if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage))
+						ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eFragmentShader);
+					first_group += count;
+				}
 			}
 		}
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);

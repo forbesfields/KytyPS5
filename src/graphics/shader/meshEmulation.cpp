@@ -5,9 +5,42 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <utility>
 
 namespace Libs::Graphics {
+
+bool MeshEmulationBatchEnabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("KYTY_PERF_MESH_BATCH");
+        const bool active = value == nullptr || std::strcmp(value, "0") != 0;
+        std::printf("KYTY_PERF_MESH_BATCH=%u (mesh instance batching)\n", unsigned(active));
+        return active;
+    }();
+    return enabled;
+}
+
+uint32_t MeshEmulationHeaderDword(uint32_t user_clip_planes) {
+    using ShaderRecompiler::IR::PushData;
+    const auto start = PushData::GraphicsDrawDwords(true, false, user_clip_planes);
+    return MeshEmulationBatchEnabled() && PushData::CanFit(start, MeshEmulationLayout::HeaderDwords)
+        ? start : PushData::NoStart;
+}
+
+MeshEmulationBatch PlanMeshEmulationBatch(
+    uint32_t groups, uint32_t instances, uint64_t capacity,
+    uint32_t max_groups, uint32_t max_instances) {
+    EXIT_IF(groups == 0u || instances == 0u || capacity == 0u ||
+            max_groups == 0u || max_instances == 0u);
+    MeshEmulationBatch batch;
+    batch.groups = static_cast<uint32_t>(std::min<uint64_t>({groups, capacity, max_groups}));
+    // Keep instance order when a single instance needs more than one group chunk.
+    batch.instances = batch.groups < groups ? 1u : static_cast<uint32_t>(
+        std::min<uint64_t>({instances, capacity / batch.groups, max_instances}));
+    return batch;
+}
 
 MeshEmulationLayout BuildMeshEmulationLayout(
     const std::vector<ShaderRecompiler::IR::StageOutput>& outputs,
@@ -66,6 +99,11 @@ public:
         builder.AddAnnotation(spv::OpDecorate, vertex_index, spv::DecorationBuiltIn,
                               spv::BuiltInVertexIndex);
         interface.push_back(vertex_index);
+        instance_index = builder.DefineGlobalVariable(Pointer(spv::StorageClassInput, int_type),
+                                                      spv::StorageClassInput);
+        builder.AddAnnotation(spv::OpDecorate, instance_index, spv::DecorationBuiltIn,
+                              spv::BuiltInInstanceIndex);
+        interface.push_back(instance_index);
     }
 
     std::vector<uint32_t> Emit() {
@@ -114,7 +152,11 @@ public:
         builder.AddFunction(spv::OpLabel, builder.AllocateId());
         const auto vertex = Result(spv::OpBitcast, uint_type, Result(spv::OpLoad, int_type, vertex_index));
         const auto triangle = Binary(spv::OpUDiv, vertex, Uint(3u));
-        const auto group = Binary(spv::OpUDiv, triangle, Uint(layout.max_primitives));
+        const auto instance = Result(spv::OpBitcast, uint_type,
+                                     Result(spv::OpLoad, int_type, instance_index));
+        const auto group = Binary(spv::OpIAdd,
+            Binary(spv::OpUDiv, triangle, Uint(layout.max_primitives)),
+            Binary(spv::OpIMul, instance, Read(Uint(2u))));
         const auto primitive = Binary(spv::OpUMod, triangle, Uint(layout.max_primitives));
         const auto base = Binary(spv::OpIAdd, Uint(MeshEmulationLayout::HeaderDwords),
                                   Binary(spv::OpIMul, group, Uint(layout.GroupDwords())));
@@ -216,7 +258,8 @@ private:
     ShaderRecompiler::Spirv::Builder builder{0x00010500u};
     const MeshEmulationLayout& layout;
     uint32_t provoking;
-    uint32_t void_type, bool_type, uint_type, int_type, float_type, vec4_type, storage, vertex_index;
+    uint32_t void_type, bool_type, uint_type, int_type, float_type, vec4_type, storage, vertex_index,
+             instance_index;
     std::vector<uint32_t> interface;
 };
 
