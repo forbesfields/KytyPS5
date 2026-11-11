@@ -18,9 +18,15 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/gpuCacheBudget.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -144,6 +150,55 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
 	const auto         available      = budget > usage ? budget - usage : uint64_t {0};
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
+}
+
+GraphicContext::UnifiedMemoryUsage GraphicContext::GetUnifiedMemoryUsage() const {
+	vk::PhysicalDeviceMemoryBudgetPropertiesEXT driver {};
+	vk::PhysicalDeviceMemoryProperties2 properties {};
+	properties.pNext = &driver;
+	physical_device.getMemoryProperties2(&properties);
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	UnifiedMemoryUsage usage {};
+	for (uint32_t heap = 0; heap < properties.memoryProperties.memoryHeapCount; ++heap) {
+		usage.driver_bytes += driver.heapUsage[heap];
+		usage.allocator_block_bytes += budgets[heap].statistics.blockBytes;
+	}
+	return usage;
+}
+
+std::optional<uint64_t> GraphicContext::GetUnifiedCacheLimit() const {
+#if defined(__APPLE__)
+	if (!CanReportMemoryUsage() ||
+	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+		return std::nullopt;
+	}
+	uint64_t host_ram = 0;
+	size_t size = sizeof(host_ram);
+	if (sysctlbyname("hw.memsize", &host_ram, &size, nullptr, 0) != 0 || host_ram == 0) {
+		return std::nullopt;
+	}
+	std::array<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps {};
+	uint64_t driver_limit = 0;
+	for (const auto& heap: std::span(heaps).first(GetHeapUsage(heaps))) {
+		driver_limit += heap.budget;
+	}
+	return UnifiedGpuCacheLimit(driver_limit, host_ram, LibKernel::Memory::GetBackingCapacity());
+#else
+	return std::nullopt;
+#endif
+}
+
+CacheReclaimLevel GraphicContext::GetHostCachePressure() {
+#if defined(__APPLE__)
+	int level = 0;
+	size_t size = sizeof(level);
+	if (sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &size, nullptr, 0) == 0) {
+		if (level >= 4) return CacheReclaimLevel::Critical;
+		if (level >= 2) return CacheReclaimLevel::Pressure;
+	}
+#endif
+	return CacheReclaimLevel::Idle;
 }
 
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {

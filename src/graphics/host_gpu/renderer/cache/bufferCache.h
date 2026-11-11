@@ -21,6 +21,7 @@
 namespace Libs::Graphics {
 
 struct GraphicContext;
+struct GpuCacheBudget;
 class CommandScheduler;
 class TextureCache;
 
@@ -91,7 +92,7 @@ public:
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] RangeSet TakeBdaSync();
-	void               RunGarbageCollector();
+	void               RunGarbageCollector(const GpuCacheBudget* unified_budget);
 
 private:
 	friend struct BufferCacheTestAccess;

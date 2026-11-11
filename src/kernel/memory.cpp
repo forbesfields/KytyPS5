@@ -3314,6 +3314,10 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 	return OK;
 }
 
+uint64_t GetBackingCapacity() {
+	return PhysicalMemory::TotalSize();
+}
+
 DebugStats GetDebugStats() {
 	DebugStats stats;
 	stats.direct_total       = PhysicalMemory::Size();

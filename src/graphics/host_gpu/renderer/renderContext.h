@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/gpuCacheBudget.h"
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -18,6 +19,7 @@
 #include "kernel/eventQueue.h"
 
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <vector>
 
@@ -60,6 +62,9 @@ public:
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
 	void               RunGarbageCollector();
+	// Call before a draw prepares resources or records any bindings.
+	void               PrepareDraw();
+	void               RecordTessellationDraw(uint32_t vertices, uint32_t instances, bool indirect = false);
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -86,6 +91,11 @@ private:
 	TextureCache              m_texture_cache;
 	ImageHeap                 m_image_heap;
 	OcclusionQueries          m_occlusion_queries;
+	std::optional<uint64_t>    m_unified_cache_limit;
+	uint64_t                   m_budget_log_frame = 0;
+	std::chrono::steady_clock::time_point m_last_pool_reclaim {};
+	bool                       m_reclaim_metal_pool = false;
+	TessellationBatchBudget    m_tessellation_batch;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;

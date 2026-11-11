@@ -8,6 +8,7 @@
 
 #include <map>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <tuple>
 #include <vector>
@@ -16,6 +17,7 @@
 namespace Libs::Graphics {
 
 struct VulkanImage;
+enum class CacheReclaimLevel;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
@@ -111,6 +113,13 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	struct UnifiedMemoryUsage {
+		uint64_t driver_bytes;
+		uint64_t allocator_block_bytes;
+	};
+	[[nodiscard]] UnifiedMemoryUsage GetUnifiedMemoryUsage() const;
+	[[nodiscard]] std::optional<uint64_t> GetUnifiedCacheLimit() const;
+	[[nodiscard]] static CacheReclaimLevel GetHostCachePressure();
 
 	struct HeapUsage {
 		uint64_t usage        = 0; // Whole process, as reported by VK_EXT_memory_budget.

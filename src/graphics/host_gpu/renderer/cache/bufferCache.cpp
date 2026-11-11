@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
+#include "graphics/host_gpu/renderer/cache/gpuCacheBudget.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -650,16 +651,21 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
-void BufferCache::RunGarbageCollector() {
+void BufferCache::RunGarbageCollector(const GpuCacheBudget* unified_budget) {
 	const auto tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	const auto usage = unified_budget != nullptr ? unified_budget->used
+	                   : m_graphics.CanReportMemoryUsage() ? m_graphics.GetDeviceMemoryUsage()
+	                                                      : m_total_used_memory;
+	const auto level = unified_budget != nullptr ? unified_budget->Level(usage)
+	                   : usage >= m_critical_gc_memory ? CacheReclaimLevel::Critical
+	                   : usage >= m_trigger_gc_memory  ? CacheReclaimLevel::Pressure
+	                                                  : CacheReclaimLevel::Idle;
+	// At the soft limit, try reclaiming textures before retiring buffers.
+	if (level < CacheReclaimLevel::Pressure) {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	const bool     aggressive = level == CacheReclaimLevel::Critical;
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 

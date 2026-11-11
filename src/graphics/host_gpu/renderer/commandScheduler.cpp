@@ -13,13 +13,25 @@ static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
     : m_graphics(graphics), m_master(master) {
-	EXIT_IF(graphics.queue_family == static_cast<uint32_t>(-1));
+	Recreate();
+}
+
+void CommandScheduler::CommandPool::Recreate() {
+	EXIT_IF(m_graphics.queue_family == static_cast<uint32_t>(-1));
 	vk::CommandPoolCreateInfo create {};
-	create.queueFamilyIndex = graphics.queue_family;
+	create.queueFamilyIndex = m_graphics.queue_family;
 	create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
 	                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
-	const auto result       = graphics.device.createCommandPool(&create, nullptr, &m_pool);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || m_pool == nullptr);
+	vk::CommandPool replacement;
+	const auto result = m_graphics.device.createCommandPool(&create, nullptr, &replacement);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || replacement == nullptr);
+	if (m_pool != nullptr) {
+		m_graphics.device.destroyCommandPool(m_pool, nullptr);
+	}
+	m_pool = replacement;
+	m_buffers.clear();
+	m_ticks.clear();
+	m_hint = 0;
 }
 
 CommandScheduler::CommandPool::~CommandPool() {
@@ -152,6 +164,22 @@ void CommandScheduler::Finish() {
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
+	BeginNext();
+	PopPendingOperations();
+}
+
+void CommandScheduler::RecreateCommandPool() {
+	CheckActive();
+	if (!m_command.IsInvalid()) {
+		Submit();
+	}
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		const auto result = m_graphics.queue.waitIdle();
+		EXIT_IF(result != vk::Result::eSuccess);
+	}
+	// MoltenVK retains its temporary Metal buffers until the pool is destroyed.
+	m_command_pool.Recreate();
 	BeginNext();
 	PopPendingOperations();
 }

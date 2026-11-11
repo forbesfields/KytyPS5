@@ -714,17 +714,31 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			if (child_count == 0u || (!image_heap && count * child_count > MaxIndirectDescriptorProbes))
 				return failed("candidate count", fmt::format("rows={} limit={}", count, MaxIndirectDescriptorProbes));
 			// Affine SMEM offsets wrap in U32 before adding the aligned immediate.
-			// Image heaps retain one bulk snapshot and their absolute byte-offset mapping.
-			auto& heap_words = program.material_keys;
-			if (image_heap) {
-				heap_words.resize(table_size / 4u);
-				if (!ReadScalarTable(table_base, table_size, 0u, runtime, heap_words))
-					return read_failed("image heap read", 0u, 0u, table_base, 0u, heap_words.size() * sizeof(uint32_t));
-			}
+			// Preserve absolute mapping slots without retaining a full table copy per program.
+			constexpr uint64_t MaxImageHeapWindowBytes = 64u * 1024u;
+			const auto table_offset_of = [&](uint32_t word) {
+				return affine ? first + uint64_t {word} * step : uint64_t {word} * 4u;
+			};
+			const uint64_t window_words =
+			    std::max<uint64_t>(1u, MaxImageHeapWindowBytes / std::max<uint64_t>(step, 4u));
+			std::vector<uint32_t> heap_words;
+			uint64_t heap_window_first = 0u;
+			uint32_t heap_window_word = UINT32_MAX;
+			const auto load_heap_window = [&](uint32_t word) {
+				const auto begin = static_cast<uint32_t>(uint64_t {word} / window_words * window_words);
+				if (begin == heap_window_word) return true;
+				heap_window_word = begin;
+				heap_window_first = table_offset_of(begin) & ~uint64_t {3};
+				const auto last = table_offset_of(static_cast<uint32_t>(
+				    std::min<uint64_t>(uint64_t {begin} + window_words, count) - 1u));
+				const auto end = std::min<uint64_t>(table_size, last + descriptor_bytes);
+				heap_words.resize(static_cast<size_t>((end - heap_window_first) / 4u));
+				return ReadScalarTable(table_base, table_size, heap_window_first, runtime, heap_words);
+			};
 			const auto mapping_offset = snapshot.flattened_srt.size();
 			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
 			for (uint32_t word = 0; word < count; ++word) {
-				const auto table_offset = affine ? first + word * step : uint64_t {word} * 4u;
+				const auto table_offset = table_offset_of(word);
 				uint64_t pointer_base = 0u;
 				if (pointer != nullptr) {
 					std::array<uint32_t, 2> address {};
@@ -744,7 +758,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 						if (!ReadScalarTable(table_base, table_size, table_offset, runtime,
 						                     std::span(candidate.dwords).first(read_dwords))) return false;
 					} else {
-						const auto table_word = table_offset / 4u;
+						if (!load_heap_window(word))
+							return read_failed("image heap read", word, 0u, table_base, heap_window_first,
+							                   heap_words.size() * sizeof(uint32_t));
+						const auto table_word = static_cast<size_t>((table_offset - heap_window_first) / 4u);
 						std::copy_n(heap_words.begin() + table_word,
 						            std::min<size_t>(read_dwords, heap_words.size() - table_word),
 						            candidate.dwords.begin());

@@ -1,11 +1,14 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cinttypes>
 
 namespace Libs::Graphics {
 
@@ -15,8 +18,18 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_pipeline_cache(graphics, &m_image_heap, shader_store), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
-      m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler) {
+      m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler),
+      m_unified_cache_limit(graphics.GetUnifiedCacheLimit()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	if (m_unified_cache_limit) {
+		vk::PhysicalDeviceDriverProperties driver {};
+		vk::PhysicalDeviceProperties2 properties {};
+		properties.pNext = &driver;
+		graphics.physical_device.getProperties2(&properties);
+		m_reclaim_metal_pool = driver.driverID == vk::DriverId::eMoltenvk;
+		Log::WriteToConsoleAndLog(fmt::format("Unified GPU cache budget: {} MiB\n",
+		                                      *m_unified_cache_limit / (1024 * 1024)));
+	}
 }
 
 RenderContext::~RenderContext() {
@@ -159,15 +172,75 @@ void RenderContext::PrepareBda() {
 	m_fault_process_pending = true;
 }
 
+void RenderContext::PrepareDraw() {
+	if (!m_reclaim_metal_pool || !m_tessellation_batch.NeedsReclaim()) {
+		return;
+	}
+	const auto before = m_graphics.GetUnifiedMemoryUsage();
+	m_command_scheduler.RecreateCommandPool();
+	m_tessellation_batch.Reset();
+	m_last_pool_reclaim = std::chrono::steady_clock::now();
+	const auto after = m_graphics.GetUnifiedMemoryUsage();
+	constexpr uint64_t MiB = 1024 * 1024;
+	LOGF("Metal tessellation pool retired: driver=%" PRIu64 " -> %" PRIu64 " MiB\n",
+	     before.driver_bytes / MiB, after.driver_bytes / MiB);
+}
+
+void RenderContext::RecordTessellationDraw(uint32_t vertices, uint32_t instances, bool indirect) {
+	if (m_reclaim_metal_pool) {
+		if (indirect) {
+			m_tessellation_batch.RecordIndirect();
+		} else {
+			m_tessellation_batch.Record(vertices, instances);
+		}
+	}
+}
+
 void RenderContext::RunGarbageCollector() {
+	m_command_scheduler.PopPendingOperations();
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_image_heap.RunGarbageCollector();
 	m_texture_cache.ProcessDownloadImages();
-	m_texture_cache.RunGarbageCollector();
-	m_buffer_cache.RunGarbageCollector();
+	if (m_unified_cache_limit) {
+		constexpr uint64_t MiB = 1024 * 1024;
+		const auto frame = m_budget_log_frame++;
+		auto usage = m_graphics.GetUnifiedMemoryUsage();
+		GpuCacheBudget budget {usage.driver_bytes, *m_unified_cache_limit,
+		                       GraphicContext::GetHostCachePressure()};
+		if (m_reclaim_metal_pool && (m_tessellation_batch.NeedsFrameReclaim() ||
+		    budget.ShouldReclaimDriverPool(usage.allocator_block_bytes,
+		        std::chrono::steady_clock::now() - m_last_pool_reclaim))) {
+			const auto before = usage;
+			m_command_scheduler.RecreateCommandPool();
+			m_tessellation_batch.Reset();
+			usage = m_graphics.GetUnifiedMemoryUsage();
+			budget.used = usage.driver_bytes;
+			budget.host_level = GraphicContext::GetHostCachePressure();
+			// Measure the cooldown in wall time so slow frames do not delay critical reclaim.
+			m_last_pool_reclaim = std::chrono::steady_clock::now();
+			LOGF("Metal command pool retired: driver=%" PRIu64 " -> %" PRIu64
+			     " MiB, VMA blocks=%" PRIu64 " -> %" PRIu64 " MiB\n",
+			     before.driver_bytes / MiB, usage.driver_bytes / MiB,
+			     before.allocator_block_bytes / MiB, usage.allocator_block_bytes / MiB);
+		}
+		if (frame % 120 == 0) {
+			using Common::DebugCounters::Counter;
+			using Common::DebugCounters::Get;
+			LOGF("Unified GPU cache: used=%" PRIu64 " MiB limit=%" PRIu64
+			     " MiB level=%u host=%u texture_evictions=%" PRIu64 " buffer_evictions=%" PRIu64 "\n",
+			     budget.used / (1024 * 1024), budget.limit / (1024 * 1024),
+			     static_cast<unsigned>(budget.Level(budget.used)), static_cast<unsigned>(budget.host_level),
+			     Get(Counter::TextureEvictions), Get(Counter::BufferEvictions));
+		}
+		m_texture_cache.RunGarbageCollector(&budget);
+		m_buffer_cache.RunGarbageCollector(&budget);
+	} else {
+		m_texture_cache.RunGarbageCollector(nullptr);
+		m_buffer_cache.RunGarbageCollector(nullptr);
+	}
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {

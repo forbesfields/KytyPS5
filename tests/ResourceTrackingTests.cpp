@@ -458,6 +458,88 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
              "a descriptor read sharing its memory index entered the table plan");
 }
 
+void TestLargeImageHeapWindowedRead() {
+  auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(
+      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  constexpr uint64_t table_base = 0x2000u;
+  constexpr uint32_t records = 2048u;
+  std::array<uint32_t, 16> data{0x3000u, 4u << 16u, 0x100000u, 0u,
+                                static_cast<uint32_t>(table_base), 48u << 16u, records, 0u};
+  std::copy_n(data.begin(), 4u, data.begin() + 12u);
+  LinearTestMemory memory;
+  memory.words.assign((table_base + uint64_t {records} * 48u) / 4u, 0u);
+  memory.watched_address = table_base;
+  const auto put = [&](uint64_t offset, uint32_t identity) {
+    auto value = descriptor;
+    value[0] += identity;
+    std::copy(value.begin(), value.end(), memory.words.begin() +
+        static_cast<uint32_t>(table_base - memory.base + offset) / 4u);
+  };
+  put(16u, 0u);
+  put(65536u, 1u);
+  const SrtRuntime runtime{.user_data = data, .userdata = &memory,
+                           .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 3u && snapshot.images[1].dwords == descriptor,
+        "large image heap dropped a descriptor from its first read window");
+  auto later = descriptor;
+  later[0] += 1u;
+  Check(snapshot.images[2].dwords == later,
+        "large image heap dropped a descriptor from a later read window");
+  Check(memory.reads == 2u && memory.watched_reads == 1u &&
+            memory.watched_dwords == 64u * 1024u / 4u + 4u,
+        "large image heap read beyond its bounded host window");
+  Check(plan.material_keys.capacity() == 0u,
+        "large image heap retained a table-sized materialization scratch");
+  const auto root = specialization.images[0];
+  const auto mapping = root.indirect_mapping_offset;
+  Check(root.indirect_search_iterations == 0u &&
+            snapshot.flattened_srt[mapping] == 65536u / 4u + 1u &&
+            snapshot.flattened_srt[mapping + 1u + 16u / 4u] == 1u &&
+            snapshot.flattened_srt[mapping + 1u + 65536u / 4u] == 2u,
+        "large image heap mapping lost its absolute word slots");
+
+  // A large scalar immediate must not pull the skipped prefix into the first window.
+  auto shifted = MakeIndirectImageFixture(false, 48u, 65536u, 16u);
+  shifted->PlanAndTrack();
+  const auto shifted_plan = ExtractResourcePlan(shifted->program);
+  memory.reads = memory.watched_reads = memory.watched_dwords = 0u;
+  memory.watched_address = table_base + 65536u;
+  memory.fail_address = table_base;
+  Check(MaterializeResources(shifted_plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2u && snapshot.images[1].dwords == later &&
+            memory.reads == 1u && memory.watched_reads == 1u &&
+            memory.watched_dwords <= 64u * 1024u / 4u + 8u &&
+            shifted_plan.material_keys.capacity() == 0u,
+        "shifted image heap read or retained its unused leading prefix");
+
+  // Exact key ranges can keep a sub-DWORD stride. Scalar loads align each address.
+  auto unaligned_plan = ExtractResourcePlan(fixture->program);
+  auto &unaligned = *unaligned_plan.descriptor_sources[
+      unaligned_plan.info.images[0].source].indirect_descriptor;
+  unaligned.table_stride = 34u;
+  unaligned.table_maximum = 2047u;
+  unaligned.table_offset = unaligned.table_immediate = 0u;
+  std::fill(memory.words.begin(), memory.words.end(), 0u);
+  memory.fail_address = UINT64_MAX;
+  put(65516u, 0u); // key 1927: floor(1927 * 34 / 4) * 4
+  put(65552u, 1u); // key 1928, in the same window with a different byte alignment
+  Check(MaterializeResources(unaligned_plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 3u && snapshot.images[1].dwords == descriptor &&
+            snapshot.images[2].dwords == later,
+        "unaligned image heap window shifted descriptor DWORDs");
+}
+
 void TestResidentImageHeap() {
   struct FakeImageHeap final : ImageHeapSource {
     bool accept = true;
@@ -9151,6 +9233,7 @@ int main() {
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
+    Run("large image heap windows", TestLargeImageHeapWindowedRead);
     Run("resident image heap", TestResidentImageHeap);
     Run("image heap kinds", TestImageHeapKinds);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);

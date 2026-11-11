@@ -26,6 +26,8 @@ public:
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           Finish();
+	// At a frame boundary, release driver allocations that live as long as the pool.
+	void           RecreateCommandPool();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
@@ -59,6 +61,7 @@ private:
 		KYTY_CLASS_NO_COPY(CommandPool);
 
 		vk::CommandBuffer Commit();
+		void Recreate();
 
 	private:
 		static constexpr size_t GrowStep = 4;
