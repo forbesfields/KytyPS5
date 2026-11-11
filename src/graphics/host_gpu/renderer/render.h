@@ -191,7 +191,7 @@ private:
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                          DrawRenderState& state);
 	void               ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                       const DrawRenderState& state, const DrawEmitInfo& emit,
+	                                       DrawRenderState& state, const DrawEmitInfo& emit,
 	                                       const DrawIndexBufferSource& index_source);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
