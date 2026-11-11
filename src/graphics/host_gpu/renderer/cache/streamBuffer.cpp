@@ -61,9 +61,10 @@ constexpr vk::AccessFlags MEMORY_ACCESS =
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool allow_failure)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
+               BufferAllocationOptions allocation_options)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
-      m_flags(flags), m_size(size) {
+      m_flags(flags), m_size(size), m_dedicated(allocation_options.dedicated) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
@@ -75,6 +76,10 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
+	// Adaptive rings must release their backing, not leave an empty pooled block.
+	if (m_dedicated) {
+		allocation_info.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+	}
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
@@ -87,7 +92,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	    &native_buffer, &m_allocation, &allocation_result));
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
-		if (allow_failure) {
+		if (allocation_options.allow_failure) {
 			return;
 		}
 	}
@@ -118,8 +123,9 @@ Buffer::~Buffer() {
 }
 
 bool Buffer::Grow(uint64_t size) {
-	auto replacement = std::make_unique<Buffer>(Graphics(), Scheduler(), Usage(), m_cpu_address,
-	                                            m_flags, size, true);
+	auto replacement = std::make_unique<Buffer>(
+	    Graphics(), Scheduler(), Usage(), m_cpu_address, m_flags, size,
+	    BufferAllocationOptions {.allow_failure = true, .dedicated = m_dedicated});
 	if (replacement->Handle() == nullptr) {
 		return false;
 	}
@@ -223,7 +229,8 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                            uint64_t size, uint64_t maximum_size)
     : Buffer(graphics, scheduler, usage, 0,
-	         AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size),
+             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size,
+             BufferAllocationOptions {.dedicated = maximum_size != 0}),
       m_maximum_size(maximum_size), m_current_watches(WATCHES_INITIAL_RESERVE),
       m_previous_watches(WATCHES_INITIAL_RESERVE) {
 	// Downloads retain mapped pointers. Shader-visible rings can retain device addresses.

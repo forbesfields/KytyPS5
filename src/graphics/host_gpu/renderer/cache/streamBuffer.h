@@ -29,6 +29,11 @@ enum class MemoryUsage : uint8_t {
 	Stream,
 };
 
+struct BufferAllocationOptions {
+	bool allow_failure = false;
+	bool dedicated = false;
+};
+
 inline constexpr vk::BufferUsageFlags ReadFlags =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eUniformBuffer |
     vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
@@ -41,7 +46,7 @@ class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
-	       bool allow_failure = false);
+	       BufferAllocationOptions allocation_options = {});
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -96,6 +101,7 @@ private:
 	vk::BufferUsageFlags          m_flags;
 	uint64_t                      m_size;
 	uint64_t                      m_allocation_size = 0;
+	bool                          m_dedicated = false;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;
 };
