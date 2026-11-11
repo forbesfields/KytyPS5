@@ -2,8 +2,10 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBufferGrowth.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include <cstring>
@@ -59,9 +61,10 @@ constexpr vk::AccessFlags MEMORY_ACCESS =
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
+               BufferAllocationOptions allocation_options)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
-      m_size(size) {
+      m_flags(flags), m_size(size), m_dedicated(allocation_options.dedicated) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
@@ -73,6 +76,10 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
+	// Adaptive rings must release their backing, not leave an empty pooled block.
+	if (m_dedicated) {
+		allocation_info.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+	}
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
@@ -85,10 +92,14 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	    &native_buffer, &m_allocation, &allocation_result));
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
+		if (allocation_options.allow_failure) {
+			return;
+		}
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
+	m_allocation_size = allocation_result.size;
 	if (with_bda) {
 		vk::BufferDeviceAddressInfo address_info {};
 		address_info.buffer = m_buffer;
@@ -109,6 +120,25 @@ Buffer::~Buffer() {
 	if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
+}
+
+bool Buffer::Grow(uint64_t size) {
+	auto replacement = std::make_unique<Buffer>(
+	    Graphics(), Scheduler(), Usage(), m_cpu_address, m_flags, size,
+	    BufferAllocationOptions {.allow_failure = true, .dedicated = m_dedicated});
+	if (replacement->Handle() == nullptr) {
+		return false;
+	}
+	std::swap(m_buffer, replacement->m_buffer);
+	std::swap(m_allocation, replacement->m_allocation);
+	std::swap(m_device_address, replacement->m_device_address);
+	std::swap(m_size, replacement->m_size);
+	std::swap(m_allocation_size, replacement->m_allocation_size);
+	std::swap(m_coherent, replacement->m_coherent);
+	std::swap(m_mapped, replacement->m_mapped);
+	// Recorded commands still use the old allocation. Retire it at this tick.
+	Scheduler().DeferOperation([owner = std::move(replacement)]() mutable { owner.reset(); });
+	return true;
 }
 
 void Buffer::Flush(uint64_t offset, uint64_t size) {
@@ -197,10 +227,41 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-                           uint64_t size)
+                           uint64_t size, uint64_t maximum_size)
     : Buffer(graphics, scheduler, usage, 0,
-             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size),
-      m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
+             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size,
+             BufferAllocationOptions {.dedicated = maximum_size != 0}),
+      m_maximum_size(maximum_size), m_current_watches(WATCHES_INITIAL_RESERVE),
+      m_previous_watches(WATCHES_INITIAL_RESERVE) {
+	// Downloads retain mapped pointers. Shader-visible rings can retain device addresses.
+	EXIT_IF(maximum_size != 0 && (usage != MemoryUsage::Upload || maximum_size < size));
+}
+
+bool StreamBuffer::GrowRing(uint64_t required) {
+	if (m_growth_failed) {
+		return false;
+	}
+	const auto previous = Size();
+	const auto grown    = TryGrowUploadRing(previous, required, m_maximum_size, [&](uint64_t next) {
+		if (!Grow(next)) {
+			m_growth_failed = true;
+			LOGF("Upload ring growth failed: %.3f -> %.3f MiB; keep current ring\n",
+			     previous / 1048576.0, next / 1048576.0);
+			return false;
+		}
+		return true;
+	});
+	if (grown) {
+		m_offset               = 0;
+		m_mapped_size          = 0;
+		m_current_watch_cursor = 0;
+		m_invalidation_mark.reset();
+		m_wait_cursor = 0;
+		m_wait_bound  = 0;
+		LOGF("Upload ring grew: %.3f -> %.3f MiB\n", previous / 1048576.0, Size() / 1048576.0);
+	}
+	return grown;
+}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
                                         uint64_t& alignment) {
@@ -229,6 +290,9 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 		return {nullptr, 0};
 	}
 	if (mapped_size > Size()) {
+		if (GrowRing(mapped_size)) {
+			return Map(size, alignment, allow_wait);
+		}
 		return {nullptr, 0};
 	}
 
@@ -247,9 +311,17 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	auto invalidation_mark =
 	    wrap ? std::optional<size_t> {m_current_watch_cursor} : m_invalidation_mark;
 	auto& pending_watches = wrap ? m_current_watches : m_previous_watches;
+	const bool can_grow = Size() < m_maximum_size && !m_growth_failed;
 	if (!WaitPendingOperations(pending_watches, invalidation_mark, aligned_offset + mapped_size,
-	                           allow_wait, wait_cursor, wait_bound)) {
-		return {nullptr, 0};
+	                           allow_wait && !can_grow, wait_cursor, wait_bound)) {
+		if (can_grow && GrowRing(Size() + 1)) {
+			return Map(size, alignment, allow_wait);
+		}
+		if (!allow_wait || !can_grow ||
+		    !WaitPendingOperations(pending_watches, invalidation_mark, aligned_offset + mapped_size,
+		                           true, wait_cursor, wait_bound)) {
+			return {nullptr, 0};
+		}
 	}
 
 	if (wrap) {

@@ -1,6 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
-#include "graphics/host_gpu/renderer/cache/gpuCacheBudget.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -8,6 +7,8 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/gpuCacheBudget.h"
+#include "graphics/host_gpu/renderer/cache/streamBufferGrowth.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -17,6 +18,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -30,6 +32,22 @@ constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 // GPU-modified ranges come as many small scattered islands, so a readback widens to a window.
 constexpr uint64_t DownloadWindowSize = 512 * 1024;
+
+bool AdaptiveUploadRing() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PERF_ADAPTIVE_UPLOAD_RING");
+		const bool  on    = value == nullptr || std::strcmp(value, "0") != 0;
+		LOGF("KYTY_PERF_ADAPTIVE_UPLOAD_RING=%d\n", static_cast<int>(on));
+		return on;
+	}();
+	return enabled;
+}
+
+void LogFixedAllocation(const char* name, const Buffer& buffer) {
+	LOGF("Fixed GPU allocation: %s size=%.3f MiB allocation=%.3f MiB\n", name,
+	     buffer.Size() / static_cast<double>(MiB),
+	     buffer.AllocationSize() / static_cast<double>(MiB));
+}
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -240,13 +258,22 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                             BDA_PAGETABLE_SIZE),
+	                         BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload,
+                       UploadRingInitialSize(AdaptiveUploadRing()),
+                       AdaptiveUploadRing() ? UploadRingMaximumSize : 0),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	LogFixedAllocation("GDS", m_gds_buffer);
+	LogFixedAllocation("BDA address table", m_bda_pagetable_buffer);
+	LogFixedAllocation("upload ring", m_staging_buffer);
+	LogFixedAllocation("stream ring", m_stream_buffer);
+	LogFixedAllocation("download ring", m_download_buffer);
+	LogFixedAllocation("device utility ring", m_device_buffer);
+	LogFixedAllocation("fault buffer", *m_fault_manager.GetFaultBuffer());
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -258,6 +285,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
+	LogFixedAllocation("null buffer", GetBuffer(null_id));
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;

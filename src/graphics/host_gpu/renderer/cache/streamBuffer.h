@@ -29,6 +29,11 @@ enum class MemoryUsage : uint8_t {
 	Stream,
 };
 
+struct BufferAllocationOptions {
+	bool allow_failure = false;
+	bool dedicated = false;
+};
+
 inline constexpr vk::BufferUsageFlags ReadFlags =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eUniformBuffer |
     vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
@@ -40,12 +45,14 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
+	       BufferAllocationOptions allocation_options = {});
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
+	[[nodiscard]] uint64_t           AllocationSize() const noexcept { return m_allocation_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
@@ -75,6 +82,7 @@ public:
 	size_t lru_id       = 0;
 
 protected:
+	[[nodiscard]] bool              Grow(uint64_t size);
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
 	[[nodiscard]] CommandScheduler& Scheduler() const noexcept { return *m_scheduler; }
 
@@ -90,7 +98,10 @@ private:
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
+	vk::BufferUsageFlags          m_flags;
 	uint64_t                      m_size;
+	uint64_t                      m_allocation_size = 0;
+	bool                          m_dedicated = false;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;
 };
@@ -107,7 +118,7 @@ public:
 	};
 
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	             uint64_t size);
+	             uint64_t size, uint64_t maximum_size = 0);
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);
@@ -117,6 +128,8 @@ public:
 
 private:
 	friend struct StreamBufferTestAccess;
+
+	[[nodiscard]] bool GrowRing(uint64_t required);
 
 	struct Watch {
 		uint64_t tick        = 0;
@@ -130,6 +143,8 @@ private:
 	                                                uint64_t requested_upper_bound, bool allow_wait,
 	                                                size_t& wait_cursor, uint64_t& wait_bound);
 
+	uint64_t              m_maximum_size  = 0;
+	bool                  m_growth_failed = false;
 	uint64_t              m_offset      = 0;
 	uint64_t              m_mapped_size = 0;
 	std::vector<Watch>    m_current_watches;
