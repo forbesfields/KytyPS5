@@ -67,6 +67,8 @@ void TestPerVertexBufferEmission() {
   const auto captured = RecompileForVertexStoreTest(vertex_code, capture_options, capture_profile);
   CheckSpirvBinaryValidates(captured.spirv);
   const auto capture_text = DisassembleSpirvBinary(captured.spirv);
+  Check(capture_text.find("PushConstant") == std::string::npos,
+        "native capture read the emulated-mesh push header");
   Check(capture_text.find("OpAtomicExchange") != std::string::npos &&
         capture_text.find("DescriptorSet 2") != std::string::npos,
         "vertex capture lost atomic records or its private descriptor set");

@@ -138,7 +138,9 @@ void EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitMeshEmulationHeaderLoad(EmitterState& state, uint32_t index) {
-	const auto start = MeshEmulationHeaderDword(state.user_clip_planes);
+	// Native vertex capture also uses this helper, but its header stays in storage.
+	const auto start = state.MeshEmulated() ? MeshEmulationHeaderDword(state.user_clip_planes)
+	                                        : IR::PushData::NoStart;
 	if (start != IR::PushData::NoStart)
 		return EmitPushDataLoad(state, ConstantU32(state, start + index));
 	const auto pointer = state.builder.AllocateId();
