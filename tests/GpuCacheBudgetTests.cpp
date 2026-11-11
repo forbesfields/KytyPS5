@@ -65,6 +65,14 @@ int main() {
 	      "a stale driver sample must not wrap the untracked byte count");
 
 	Libs::Graphics::TessellationBatchBudget batch;
+	constexpr uint64_t MiB = 1024 * 1024;
+	Check(!batch.HasDriverOverhead(5592 * MiB, 5592 * MiB),
+	      "equal driver and VMA usage must not force a pool reclaim wait");
+	Check(!batch.HasDriverOverhead(5592 * MiB, 5700 * MiB),
+	      "driver samples below VMA blocks must not wrap into apparent overhead");
+	Check(!batch.HasDriverOverhead(5592 * MiB + 128 * MiB - 1, 5592 * MiB) &&
+	          batch.HasDriverOverhead(5592 * MiB + 128 * MiB, 5592 * MiB),
+	      "early tessellation reclaim requires at least 128 MiB of driver overhead");
 	Check(!batch.NeedsReclaim(), "an empty pool needs no tessellation reclaim");
 	for (unsigned draw = 0; draw < 18; ++draw) {
 		batch.Record(28416, 1);

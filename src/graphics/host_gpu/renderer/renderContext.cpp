@@ -177,13 +177,19 @@ void RenderContext::PrepareDraw() {
 		return;
 	}
 	const auto before = m_graphics.GetUnifiedMemoryUsage();
+	if (!TessellationBatchBudget::HasDriverOverhead(before.driver_bytes, before.allocator_block_bytes)) {
+		m_tessellation_batch.Reset();
+		return;
+	}
 	m_command_scheduler.RecreateCommandPool();
 	m_tessellation_batch.Reset();
 	m_last_pool_reclaim = std::chrono::steady_clock::now();
 	const auto after = m_graphics.GetUnifiedMemoryUsage();
 	constexpr uint64_t MiB = 1024 * 1024;
-	LOGF("Metal tessellation pool retired: driver=%" PRIu64 " -> %" PRIu64 " MiB\n",
-	     before.driver_bytes / MiB, after.driver_bytes / MiB);
+	LOGF("Metal tessellation pool reclaimed: driver=%" PRIu64 " -> %" PRIu64
+	     " MiB, VMA blocks=%" PRIu64 " -> %" PRIu64 " MiB\n",
+	     before.driver_bytes / MiB, after.driver_bytes / MiB,
+	     before.allocator_block_bytes / MiB, after.allocator_block_bytes / MiB);
 }
 
 void RenderContext::RecordTessellationDraw(uint32_t vertices, uint32_t instances, bool indirect) {
@@ -210,7 +216,8 @@ void RenderContext::RunGarbageCollector() {
 		auto usage = m_graphics.GetUnifiedMemoryUsage();
 		GpuCacheBudget budget {usage.driver_bytes, *m_unified_cache_limit,
 		                       GraphicContext::GetHostCachePressure()};
-		if (m_reclaim_metal_pool && (m_tessellation_batch.NeedsFrameReclaim() ||
+		if (m_reclaim_metal_pool && ((m_tessellation_batch.NeedsFrameReclaim() &&
+		    TessellationBatchBudget::HasDriverOverhead(usage.driver_bytes, usage.allocator_block_bytes)) ||
 		    budget.ShouldReclaimDriverPool(usage.allocator_block_bytes,
 		        std::chrono::steady_clock::now() - m_last_pool_reclaim))) {
 			const auto before = usage;
@@ -221,7 +228,7 @@ void RenderContext::RunGarbageCollector() {
 			budget.host_level = GraphicContext::GetHostCachePressure();
 			// Measure the cooldown in wall time so slow frames do not delay critical reclaim.
 			m_last_pool_reclaim = std::chrono::steady_clock::now();
-			LOGF("Metal command pool retired: driver=%" PRIu64 " -> %" PRIu64
+			LOGF("Metal command pool reclaimed: driver=%" PRIu64 " -> %" PRIu64
 			     " MiB, VMA blocks=%" PRIu64 " -> %" PRIu64 " MiB\n",
 			     before.driver_bytes / MiB, usage.driver_bytes / MiB,
 			     before.allocator_block_bytes / MiB, usage.allocator_block_bytes / MiB);
