@@ -169,7 +169,16 @@ void RenderContext::PrepareBda() {
 }
 
 void RenderContext::PrepareDraw() {
-	if (!m_reclaim_metal_pool || !m_tessellation_batch.NeedsReclaim()) {
+	const bool use_ring = m_command_scheduler.PoolRingEnabled();
+	if (!m_reclaim_metal_pool || !m_tessellation_batch.NeedsReclaim(use_ring)) {
+		return;
+	}
+	if (use_ring) {
+		// Rotation is asynchronous. Sample driver bytes at the frame boundary,
+		// where completed pools have been collected, instead of around each rotation.
+		m_command_scheduler.RecreateCommandPool();
+		m_tessellation_batch.Reset();
+		m_last_pool_reclaim = std::chrono::steady_clock::now();
 		return;
 	}
 	const auto before = m_graphics.GetUnifiedMemoryUsage();
@@ -193,6 +202,7 @@ void RenderContext::RecordTessellationDraw(uint32_t vertices, uint32_t instances
 }
 
 void RenderContext::RunGarbageCollector() {
+	m_command_scheduler.AdvanceCommandPoolFrame();
 	m_command_scheduler.PopPendingOperations();
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
@@ -206,9 +216,10 @@ void RenderContext::RunGarbageCollector() {
 		auto usage = m_graphics.GetUnifiedMemoryUsage();
 		GpuCacheBudget budget {usage.driver_bytes, *m_unified_cache_limit,
 		                       GraphicContext::GetHostCachePressure()};
-		if (m_reclaim_metal_pool && (m_tessellation_batch.NeedsFrameReclaim() ||
-		    budget.ShouldReclaimDriverPool(usage.allocator_block_bytes,
-		        std::chrono::steady_clock::now() - m_last_pool_reclaim))) {
+		if (m_reclaim_metal_pool &&
+		    (m_tessellation_batch.NeedsFrameReclaim(m_command_scheduler.PoolRingEnabled()) ||
+		     budget.ShouldReclaimDriverPool(usage.allocator_block_bytes,
+		         std::chrono::steady_clock::now() - m_last_pool_reclaim))) {
 			const auto before = usage;
 			m_command_scheduler.RecreateCommandPool();
 			m_tessellation_batch.Reset();

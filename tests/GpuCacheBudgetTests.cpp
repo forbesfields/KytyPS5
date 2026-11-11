@@ -64,8 +64,59 @@ int main() {
 	Check(!stale_usage.ShouldReclaimDriverPool(7 * GiB, 10s),
 	      "a stale driver sample must not wrap the untracked byte count");
 
+	using Libs::Graphics::CommandPoolRetirementAction;
+	using Libs::Graphics::CommandPoolRetirementBudget;
+	const auto poll = CommandPoolRetirementBudget::Poll;
+	Check(poll(12, 12, true, 1, 0) == CommandPoolRetirementAction::Release,
+	      "a completed tick and host fence permit pool destruction");
+	Check(poll(12, 15, true, 1, 0) == CommandPoolRetirementAction::Release,
+	      "later completed ticks also permit destruction");
+	Check(poll(12, 11, false, 1, 0) == CommandPoolRetirementAction::Pending,
+	      "a pending tick must keep its pool alive without blocking");
+	Check(poll(12, 12, false, 1, 0) == CommandPoolRetirementAction::Pending,
+	      "a GPU signal must not free a pool before its host completion fence");
+	Check(poll(12, 11, true, 1, 0) == CommandPoolRetirementAction::Pending,
+	      "a stale tick sample must be refreshed before pool destruction");
+	Check(poll(12, 11, false, CommandPoolRetirementBudget::MaxPendingPools, 0) ==
+	          CommandPoolRetirementAction::Wait,
+	      "ring exhaustion waits for the oldest pool instead of growing memory");
+	Check(poll(12, 12, false, CommandPoolRetirementBudget::MaxPendingPools, 0) ==
+	          CommandPoolRetirementAction::Wait,
+	      "ring exhaustion must wait for host completion even after the GPU signal");
+	Check(poll(12, 12, true, CommandPoolRetirementBudget::MaxPendingPools, 0) ==
+	          CommandPoolRetirementAction::Release,
+	      "a full ring with a completed oldest pool needs no wait");
+	Check(poll(12, 11, false, 1, CommandPoolRetirementBudget::MaxPendingFrames - 1) ==
+	          CommandPoolRetirementAction::Pending,
+	      "a recent retired pool can overlap GPU execution");
+	Check(poll(12, 11, false, 1, CommandPoolRetirementBudget::MaxPendingFrames) ==
+	          CommandPoolRetirementAction::Wait,
+	      "an old pool must drain even if no new pool is retired");
+	Check(poll(12, 12, false, 1, CommandPoolRetirementBudget::MaxPendingFrames) ==
+	          CommandPoolRetirementAction::Wait,
+	      "the frame bound also covers delayed host completion handlers");
+	Check(poll(12, 12, true, 1, CommandPoolRetirementBudget::MaxPendingFrames) ==
+	          CommandPoolRetirementAction::Release,
+	      "an old completed pool is released without a wait");
+
 	Libs::Graphics::TessellationBatchBudget batch;
 	Check(!batch.NeedsReclaim(), "an empty pool needs no tessellation reclaim");
+	Check(!batch.NeedsFrameReclaim(true), "an empty ring pool needs no frame retirement");
+	batch.Record(3, 1);
+	Check(!batch.NeedsFrameReclaim() && batch.NeedsFrameReclaim(true),
+	      "the ring bounds small draws to one active frame; legacy keeps the old threshold");
+	batch.Reset();
+	Check(!batch.NeedsFrameReclaim(true), "retirement clears small draws from the frame budget");
+	batch.Record(Libs::Graphics::TessellationBatchBudget::MaxRingVertices - 1, 1);
+	Check(!batch.NeedsReclaim(true), "ring work below the limit stays in the active pool");
+	batch.Record(1, 1);
+	Check(batch.NeedsReclaim(true) && !batch.NeedsReclaim(),
+	      "ring pools retire at 128K vertices while legacy pools keep the 512K limit");
+	Check(Libs::Graphics::TessellationBatchBudget::MaxRingVertices *
+	          (CommandPoolRetirementBudget::MaxPendingPools + 1) <=
+	          Libs::Graphics::TessellationBatchBudget::MaxVertices,
+	      "the sum of ring work targets must fit within the old work target");
+	batch.Reset();
 	for (unsigned draw = 0; draw < 18; ++draw) {
 		batch.Record(28416, 1);
 	}
