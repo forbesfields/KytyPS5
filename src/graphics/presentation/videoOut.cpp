@@ -597,6 +597,13 @@ VideoOutDriver::Impl& VideoOutDriver::State() noexcept {
 VideoOutDriver& VideoOutInit(uint32_t width, uint32_t height, Graphics::Presenter& presenter) {
 	EXIT_IF(g_video_out_driver != nullptr);
 	g_video_out_driver = std::make_unique<VideoOutDriver>(width, height, presenter);
+	int32_t attribute3 = 0;
+	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
+	const auto resolution = Config::GetVideoOutResolution(width, height, attribute3);
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[VideoOut] reported display={} (output-1080p={}, window={}x{})\n",
+	    resolution == 1 ? "1920x1080" : "3840x2160",
+	    Config::Output1080pEnabled() ? "on" : "off", width, height));
 	return *g_video_out_driver;
 }
 
@@ -1102,10 +1109,20 @@ bool FlipQueue::Flip() {
 	std::array<Graphics::Presenter::Layer, VideoOutDriver::Impl::VIDEO_OUT_BUSES.size()> layers {};
 	size_t                      layer_count = 0;
 	Graphics::Presenter::Frame* hidden      = nullptr; // The main port behind the headset image.
+	uint32_t guest_width = 0;
+	uint32_t guest_height = 0;
 	for (size_t i = 0; i < count; i++) {
 		auto&             r = requests[i];
 		Common::LockGuard lock(r.cfg->mutex);
 		due &= r.cfg->generation == r.generation;
+		if (r.cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN && IsValidBufferIndex(r.index)) {
+			const auto& buffer = r.cfg->buffers[r.index];
+			if (buffer.Occupied()) {
+				const auto& attribute = r.cfg->groups[buffer.group_index].attribute;
+				guest_width = attribute.width;
+				guest_height = attribute.height;
+			}
+		}
 		if (r.id == group) {
 			due &= IsFlipDueLocked(*r.cfg);
 		}
@@ -1126,7 +1143,7 @@ bool FlipQueue::Flip() {
 			m_presenter.Present(std::span(layers.data(), layer_count));
 		}
 		if (requests[0].cfg->bus == 0) {
-			Graphics::PerformanceOverlayRecordFlip(m_width, m_height);
+			Graphics::PerformanceOverlayRecordFlip(guest_width, guest_height);
 		}
 	}
 
@@ -1703,9 +1720,7 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	const bool hdr_allowed = !Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute) ||
 	                         (attribute & 0x20000000) != 0;
 	ctx->mutex.Lock();
-	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
-	status->resolution =
-	    ((attribute3 & 4) != 0 && driver.width < 3840 && driver.height < 2160 ? 1u : 2u);
+	status->resolution = Config::GetVideoOutResolution(driver.width, driver.height, attribute3);
 	status->dynamicRange = hdr_allowed && driver.IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119

@@ -47,6 +47,20 @@ target_link_libraries(launcher_game_views_tests Qt6::Widgets common)
 target_include_directories(launcher_game_views_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(launcher_game_views_tests PROPERTIES AUTOUIC ON AUTORCC ON)
 
+add_executable(launcher_output_1080p_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherOutput1080pTests.cpp"
+	include/configuration.h
+	include/configurationEditDialog.h
+	include/mandatoryLineEdit.h
+	src/configuration.cpp
+	src/configurationEditDialog.cpp
+	src/mandatoryLineEdit.cpp
+)
+target_link_libraries(launcher_output_1080p_tests Qt6::Widgets common SDL3::SDL3-static Vulkan::Headers)
+target_include_directories(launcher_output_1080p_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_output_1080p_tests PROPERTIES AUTOMOC ON AUTOUIC ON)
+add_test(NAME launcher_output_1080p COMMAND launcher_output_1080p_tests)
+
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 elseif(LINUX)

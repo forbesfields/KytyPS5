@@ -417,6 +417,18 @@ target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
 
 add_executable(build_flags_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BuildFlagsTests.cpp")
 
+add_executable(output_1080p_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/Output1080pTests.cpp")
+target_link_libraries(output_1080p_tests common)
+add_test(NAME output_1080p_default
+	COMMAND ${CMAKE_COMMAND} -E env --unset=KYTY_PERF_OUTPUT_1080P $<TARGET_FILE:output_1080p_tests>)
+add_test(NAME output_1080p_enabled
+	COMMAND ${CMAKE_COMMAND} -E env KYTY_PERF_OUTPUT_1080P=1 $<TARGET_FILE:output_1080p_tests>)
+add_test(NAME output_1080p_killed
+	COMMAND ${CMAKE_COMMAND} -E env KYTY_PERF_OUTPUT_1080P=0 $<TARGET_FILE:output_1080p_tests> --killed)
+add_test(NAME output_1080p_cli
+	COMMAND $<TARGET_FILE:kyty_emulator> --output-1080p --help)
+set_tests_properties(output_1080p_cli PROPERTIES PASS_REGULAR_EXPRESSION "Report a 1920x1080 display")
+
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PageManagerTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
