@@ -2913,8 +2913,11 @@ public:
     scheduler.Begin(registers, user_config, shaders);
     auto &resources = context;
     auto &cache = resources.GetBufferCache();
-    constexpr std::array<std::pair<MemoryUsage, uint64_t>, 4> utilities{{
-        {MemoryUsage::Upload, 512ull << 20},
+    const auto *adaptive_upload = std::getenv("KYTY_PERF_ADAPTIVE_UPLOAD_RING");
+    const bool adaptive =
+        adaptive_upload == nullptr || std::strcmp(adaptive_upload, "0") != 0;
+    const std::array<std::pair<MemoryUsage, uint64_t>, 4> utilities{{
+        {MemoryUsage::Upload, (adaptive ? 64ull : 512ull) << 20},
         {MemoryUsage::Stream, 64ull << 20},
         {MemoryUsage::Download, 64ull << 20},
         {MemoryUsage::DeviceLocal, 128ull << 20},
@@ -3037,6 +3040,63 @@ public:
 
     scheduler.Finish();
     download.Invalidate(download_offset, 16);
+
+    // Record reads from each allocation before growth. Both must survive
+    // retirement.
+    StreamBuffer growing(m_runtime_context, scheduler, MemoryUsage::Upload,
+                         small_ring_size, small_ring_size * 4);
+    Libs::Graphics::Buffer readback(m_runtime_context, scheduler, MemoryUsage::Download, 0,
+                                    AllFlags, small_ring_size * 4);
+    const auto old_handle = growing.Handle();
+    const auto old_offset =
+        growing.Copy(overflow_data.data(), overflow_data.size(), 16);
+    readback.CopyFrom(scheduler.Current(), growing, old_offset, 0,
+                      overflow_data.size());
+    const auto [grown_data, grown_offset] =
+        growing.Map(small_ring_size + 4, 16, false);
+    Require("StreamBufferRing", "oversized growth",
+            grown_data != nullptr && grown_offset == 0 &&
+                growing.Size() == small_ring_size * 2 &&
+                growing.Handle() != old_handle,
+            "upload growth did not replace the ring with a fitting allocation");
+    std::memset(grown_data, 0x3c, static_cast<size_t>(small_ring_size + 4));
+    growing.Commit();
+    readback.CopyFrom(scheduler.Current(), growing, grown_offset,
+                      small_ring_size, small_ring_size + 4);
+    const auto grown_handle = growing.Handle();
+    // Reusing the in-flight ring must grow again before it waits.
+    const auto [wrapped_growth, wrapped_growth_offset] =
+        growing.Map(small_ring_size, 16, false);
+    Require("StreamBufferRing", "busy wrap growth",
+            wrapped_growth != nullptr && wrapped_growth_offset == 0 &&
+                growing.Size() == small_ring_size * 4 &&
+                growing.Handle() != grown_handle,
+            "busy wrap did not grow the upload ring");
+    growing.Commit();
+    const auto final_handle = growing.Handle();
+    const auto [too_large, too_large_offset] =
+        growing.Map(growing.Size() + 1, 16, false);
+    Require("StreamBufferRing", "growth cap",
+            too_large == nullptr && too_large_offset == 0 &&
+                growing.Handle() == final_handle,
+            "growth exceeded the upload-ring cap or changed its allocation on "
+            "failure");
+    vk::MemoryBarrier host_read{};
+    host_read.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    host_read.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    scheduler.Current().Handle().pipelineBarrier(
+        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+        {}, 1, &host_read, 0, nullptr, 0, nullptr);
+    scheduler.Finish();
+    readback.Invalidate(0, readback.Size());
+    Require("StreamBufferRing", "retired allocation contents",
+            std::memcmp(readback.Mapped().data(), overflow_data.data(),
+                        overflow_data.size()) == 0 &&
+                std::all_of(readback.Mapped().begin() + small_ring_size,
+                            readback.Mapped().begin() + small_ring_size * 2 + 4,
+                            [](uint8_t value) { return value == 0x3c; }),
+            "growth freed or changed an upload allocation before its recorded "
+            "copy completed");
     std::printf("[host]    %-32s ok\n", "StreamBufferRing");
   }
 
