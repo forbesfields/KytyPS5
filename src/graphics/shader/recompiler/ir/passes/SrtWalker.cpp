@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -33,6 +35,13 @@ bool SrtReadCapture::Read(void* userdata, uint64_t address, std::span<uint32_t> 
 }
 
 namespace {
+
+const bool FastSrtWalker = [] {
+	const auto* value = std::getenv("KYTY_PERF_SRT_WALKER");
+	const bool result = value == nullptr || std::strcmp(value, "0") != 0;
+	std::fprintf(stderr, "Performance: KYTY_PERF_SRT_WALKER=%u\n", result ? 1u : 0u);
+	return result;
+}();
 
 bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 	const auto op = inst.GetOpcode();
@@ -444,6 +453,7 @@ private:
 	Xbyak::Label                                      m_ret;
 	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
+	const bool m_fast = FastSrtWalker;
 };
 
 void WalkerCompiler::AddOutput(Value value, uint32_t gate) {
@@ -723,6 +733,23 @@ void WalkerCompiler::Gate(std::vector<uint32_t>& gates, const Xbyak::Label& skip
 void WalkerCompiler::Zero(uint32_t offset, uint32_t size) {
 	auto& c = m_code;
 	if (size == 0) return;
+	// These short, fixed-size clears run on every draw. Avoid a string operation under Rosetta.
+	if (m_fast && size <= 256u) {
+		c.xor_(c.eax, c.eax);
+		while (size >= 8u) {
+			c.mov(c.qword[c.rdx + offset], c.rax);
+			offset += 8u;
+			size -= 8u;
+		}
+		for (const uint32_t width: {4u, 2u, 1u}) {
+			if ((size & width) == 0u) continue;
+			if (width == 4u) c.mov(c.dword[c.rdx + offset], c.eax);
+			if (width == 2u) c.mov(c.word[c.rdx + offset], c.ax);
+			if (width == 1u) c.mov(c.byte[c.rdx + offset], c.al);
+			offset += width;
+		}
+		return;
+	}
 	c.mov(c.r11, c.rdi);
 	c.lea(c.rdi, c.ptr[c.rdx + offset]);
 	c.mov(c.ecx, size);
@@ -739,9 +766,16 @@ void WalkerCompiler::Branch(const Operand& operand, const Xbyak::Label& unknown)
 		c.jmp(unknown, Near);
 	} else if (operand.kind == Kind::Node) {
 		auto& node = m_nodes[operand.value];
+		Xbyak::Label known;
+		if (m_fast) {
+			// Reused SRT operands already have a value within this walk. Skip their thunk call.
+			c.cmp(c.byte[c.rdx + node.state], 2);
+			c.je(known, Near);
+		}
 		c.call(node.label);
 		c.cmp(c.byte[c.rdx + node.state], 2);
 		c.jne(unknown, Near);
+		c.L(known);
 	}
 }
 
