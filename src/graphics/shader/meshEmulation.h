@@ -1,6 +1,7 @@
 #pragma once
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/triangleShader.h"
 
 #include <cstdint>
 #include <vector>
@@ -38,6 +39,11 @@ struct MeshEmulationLayout {
     const ShaderVertexInputInfo& input);
 
 [[nodiscard]] std::vector<uint32_t> BuildMeshEmulationVertexShader(
-    const MeshEmulationLayout& layout, uint32_t provoking_vertex);
+    const MeshEmulationLayout& layout, uint32_t provoking_vertex,
+    std::span<const TriangleParameter> corner_parameters = {});
+
+[[nodiscard]] std::vector<uint32_t> BuildVertexStoreVertexShader(
+    const MeshEmulationLayout& layout, uint32_t provoking_vertex,
+    std::span<const TriangleParameter> parameters);
 
 } // namespace Libs::Graphics

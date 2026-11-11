@@ -41,6 +41,8 @@ public:
     vk::PhysicalDeviceFeatures core{};
     core.tessellationShader = true;
     core.shaderInt64 = true;
+    core.vertexPipelineStoresAndAtomics = true;
+    core.shaderClipDistance = true;
     vk::PhysicalDeviceVulkan12Features features12{.scalarBlockLayout = true};
     vk::PhysicalDeviceVulkan13Features features13{.pNext = &features12,
       .synchronization2 = true, .dynamicRendering = true};
@@ -71,7 +73,9 @@ public:
               std::span<const uint32_t> initial, std::array<uint8_t, 4> expected,
               const RectListShaders* tessellation = nullptr,
               std::span<const uint32_t> push_data = {},
-              std::span<const std::array<uint8_t, 4>> expected_pixels = {}) {
+              std::span<const std::array<uint8_t, 4>> expected_pixels = {},
+              const std::vector<uint32_t>* capture = nullptr,
+              uint32_t draw_count = 0u, uint32_t instances = 1u, uint32_t first_instance = 0u) {
     constexpr uint32_t width = 4, height = 4;
     const auto memory = physical.getMemoryProperties();
     const auto allocate = [&](vk::MemoryRequirements requirements, vk::MemoryPropertyFlags flags) {
@@ -89,7 +93,8 @@ public:
     const auto buffer = [&](uint64_t size) {
       BufferAllocation result{};
       vk::BufferCreateInfo info{.size = size, .usage = vk::BufferUsageFlagBits::eStorageBuffer |
-        vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst};
+        vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
+        vk::BufferUsageFlagBits::eIndexBuffer};
       Ok(device.createBuffer(&info, nullptr, &result.buffer));
       result.memory = allocate(device.getBufferMemoryRequirements(result.buffer),
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
@@ -115,13 +120,15 @@ public:
     vk::ImageView view;
     Ok(device.createImageView(&view_info, nullptr, &view));
     const vk::DescriptorSetLayoutBinding binding{MeshEmulationBinding, vk::DescriptorType::eStorageBuffer,
-      1, vk::ShaderStageFlagBits::eCompute | vk::ShaderStageFlagBits::eVertex, nullptr};
+      1, vk::ShaderStageFlagBits::eCompute | vk::ShaderStageFlagBits::eVertex |
+        vk::ShaderStageFlagBits::eFragment, nullptr};
     vk::DescriptorSetLayoutCreateInfo set_info{.bindingCount = 1, .pBindings = &binding};
     vk::DescriptorSetLayout set_layout;
     Ok(device.createDescriptorSetLayout(&set_info, nullptr, &set_layout));
     const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute, 0, 128};
-    vk::PipelineLayoutCreateInfo pipeline_layout_info{.setLayoutCount = 1,
-      .pSetLayouts = &set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &push};
+    const std::array set_layouts{set_layout, set_layout, set_layout};
+    vk::PipelineLayoutCreateInfo pipeline_layout_info{.setLayoutCount = capture ? 3u : 1u,
+      .pSetLayouts = set_layouts.data(), .pushConstantRangeCount = 1, .pPushConstantRanges = &push};
     vk::PipelineLayout pipeline_layout;
     Ok(device.createPipelineLayout(&pipeline_layout_info, nullptr, &pipeline_layout));
     const vk::DescriptorPoolSize pool_size{vk::DescriptorType::eStorageBuffer, 1};
@@ -180,12 +187,43 @@ public:
       .pColorBlendState = &blend, .layout = pipeline_layout};
     vk::Pipeline graphics_pipeline;
     Ok(device.createGraphicsPipelines({}, 1, &graphics_info, nullptr, &graphics_pipeline));
+    vk::Pipeline capture_pipeline{};
+    if (capture) {
+      const vk::PipelineShaderStageCreateInfo stage{.stage = vk::ShaderStageFlagBits::eVertex,
+        .module = module(*capture), .pName = "main"};
+      auto discard = raster;
+      discard.rasterizerDiscardEnable = true;
+      const vk::PipelineRenderingCreateInfo no_attachments{};
+      const vk::PipelineColorBlendStateCreateInfo no_blend{};
+      auto info = graphics_info;
+      info.pNext = &no_attachments;
+      info.stageCount = 1u;
+      info.pStages = &stage;
+      info.pRasterizationState = &discard;
+      info.pColorBlendState = &no_blend;
+      Ok(device.createGraphicsPipelines({}, 1, &info, nullptr, &capture_pipeline));
+    }
     vk::CommandBufferAllocateInfo command_info{.commandPool = pool,
       .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 1};
     vk::CommandBuffer command;
     Ok(device.allocateCommandBuffers(&command_info, &command));
     vk::CommandBufferBeginInfo begin{};
     Ok(command.begin(&begin));
+    if (capture_pipeline) {
+      const vk::RenderingInfo empty{.renderArea = {{0,0},{1,1}}, .layerCount = 1};
+      command.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, VertexStoreSet,
+        1, &set, 0, nullptr);
+      command.beginRendering(&empty);
+      command.bindPipeline(vk::PipelineBindPoint::eGraphics, capture_pipeline);
+      command.bindIndexBuffer(output.buffer, VertexStoreHeaderDwords * sizeof(uint32_t), vk::IndexType::eUint32);
+      command.drawIndexed(draw_count, instances, 0, int32_t(initial[VertexStoreFirst]), first_instance);
+      command.endRendering();
+      const vk::MemoryBarrier barrier{.srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+        .dstAccessMask = vk::AccessFlagBits::eShaderRead};
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eVertexShader,
+        vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eFragmentShader,
+        {}, 1, &barrier, 0, nullptr, 0, nullptr);
+    }
     if (compute_pipeline) {
       command.bindPipeline(vk::PipelineBindPoint::eCompute, compute_pipeline);
       command.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0, 1, &set, 0, nullptr);
@@ -195,7 +233,8 @@ public:
       vk::MemoryBarrier barrier{.srcAccessMask = vk::AccessFlagBits::eShaderWrite,
         .dstAccessMask = vk::AccessFlagBits::eShaderRead};
       command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-        vk::PipelineStageFlagBits::eVertexShader, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+        vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eFragmentShader,
+        {}, 1, &barrier, 0, nullptr, 0, nullptr);
     }
     vk::ImageMemoryBarrier to_color{.dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
       .oldLayout = vk::ImageLayout::eUndefined, .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
@@ -211,7 +250,7 @@ public:
     command.beginRendering(&render);
     command.bindPipeline(vk::PipelineBindPoint::eGraphics, graphics_pipeline);
     command.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, 1, &set, 0, nullptr);
-    command.draw(layout.max_primitives * 3u, 1, 0, 0);
+    command.draw(draw_count ? draw_count : layout.max_primitives * 3u, instances, 0, first_instance);
     command.endRendering();
     vk::ImageMemoryBarrier to_copy = to_color;
     to_copy.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
@@ -267,11 +306,13 @@ public:
         Check(false, "portable GPU pixel mismatch");
       }
     }
-    for (uint32_t i = MeshEmulationLayout::HeaderDwords + layout.GroupDwords(); i < initial.size(); ++i)
+    const auto guard = capture ? initial.size() - 16u : MeshEmulationLayout::HeaderDwords + layout.GroupDwords();
+    for (uint32_t i = static_cast<uint32_t>(guard); i < initial.size(); ++i)
       Check(record[i] == initial[i], "mesh compute wrote beyond its output record");
     device.freeCommandBuffers(pool, 1, &command);
     device.destroyPipeline(graphics_pipeline);
     device.destroyPipeline(compute_pipeline);
+    device.destroyPipeline(capture_pipeline);
     for (auto shader : modules) device.destroyShaderModule(shader);
     device.destroyDescriptorPool(descriptor_pool);
     device.destroyPipelineLayout(pipeline_layout);
