@@ -373,7 +373,7 @@ public:
       Check(std::equal(last_header.begin(), last_header.end(), record),
             "mesh batch header or final chunk base differs");
     const auto record_count = batch_case ? batch.groups * batch.instances
-      : std::max(1u, draw_count / (layout.max_primitives * 3u));
+      : capture ? 0u : std::max(1u, draw_count / (layout.max_primitives * 3u));
     const auto guard = capture ? initial.size() - 16u
       : MeshEmulationLayout::HeaderDwords + record_count * layout.GroupDwords();
     for (uint32_t i = static_cast<uint32_t>(guard); i < initial.size(); ++i)
