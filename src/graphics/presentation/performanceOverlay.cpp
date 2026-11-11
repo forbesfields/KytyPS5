@@ -485,7 +485,9 @@ void GpuActivityRows(const Snapshot& shown) {
 	Row("Pass merges / in-pass clears",
 	    Fmt("%.0f / %.0f per frame", per_frame(Counter::RenderPassMerges),
 	        per_frame(Counter::InPassClears)));
-	Row("Attachment stores skipped", Fmt("%.0f/frame", per_frame(Counter::AttachmentStoresSkipped)));
+	// MoltenVK 1.4.2 maps STORE_OP_NONE to STORE (mvk_datatypes.mm:598).
+	// Count requests; this does not prove that the driver skipped a store.
+	Row("Store-none requested", Fmt("%.0f/frame", per_frame(Counter::AttachmentStoresSkipped)));
 	// Includes the background completion runner and present pacing waits.
 	Row("All-thread GPU timeline waits",
 	    Fmt("%.0f ms/s  (%.0f waits/s)", Rate(shown, Counter::GpuWaitNs) / 1e6,
