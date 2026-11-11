@@ -63,7 +63,7 @@ public:
 	void ApplyContextStateOperation(ContextStateOperation operation);
 
 	void            BufferInit();
-	void            BufferFlush();
+	void            BufferFlush(bool next_slice_ready = false);
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }

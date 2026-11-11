@@ -2,14 +2,36 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/logging/log.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 
 namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
+
+namespace {
+std::atomic<uint64_t> g_gpu_thread_wait_count {0};
+std::atomic<uint64_t> g_gpu_thread_wait_ns {0};
+
+bool FewerSubmitsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PERF_FEWER_SUBMITS");
+		const bool enabled = value == nullptr || std::strcmp(value, "0") != 0;
+		Log::WriteToConsoleAndLog(enabled ? "KYTY_PERF_FEWER_SUBMITS=1 (default on)\n"
+		                                 : "KYTY_PERF_FEWER_SUBMITS=0 (legacy slice flushes)\n");
+		return enabled;
+	}();
+	return enabled;
+}
+} // namespace
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
     : m_graphics(graphics), m_master(master) {
@@ -89,7 +111,9 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	FewerSubmitsEnabled();
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -158,12 +182,41 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 	BeginNext();
 }
 
+void CommandScheduler::FlushSlice(bool next_slice_ready) {
+	// Bound each batch to four slices so a long queue still starts GPU work early. Flips,
+	// readbacks, waits and explicit Flush calls submit at their original boundaries.
+	if (FewerSubmitsEnabled() && next_slice_ready && m_deferred_slices < 3 &&
+	    !HasPendingPriorityOperations()) {
+		m_deferred_slices++;
+		return;
+	}
+	Flush();
+}
+
+CommandScheduler::GpuThreadWaitStats CommandScheduler::GetGpuThreadWaitStats() {
+	return {g_gpu_thread_wait_count.load(std::memory_order_relaxed),
+	        g_gpu_thread_wait_ns.load(std::memory_order_relaxed)};
+}
+
+void CommandScheduler::WaitForGpu(uint64_t tick) {
+	if (!GuestGpu::IsGpuThread() || !Common::DebugCounters::Enabled() || IsFree(tick)) {
+		m_master.Wait(tick);
+		return;
+	}
+	const auto start = std::chrono::steady_clock::now();
+	m_master.Wait(tick);
+	const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                         std::chrono::steady_clock::now() - start).count();
+	g_gpu_thread_wait_count.fetch_add(1, std::memory_order_relaxed);
+	g_gpu_thread_wait_ns.fetch_add(static_cast<uint64_t>(elapsed), std::memory_order_relaxed);
+}
+
 void CommandScheduler::Finish() {
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	WaitForGpu(CurrentTick() - 1);
 	BeginNext();
 	PopPendingOperations();
 }
@@ -193,10 +246,10 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// resources are released only at the next GPU operation boundary.
 		const auto submitted_tick = Submit();
 		EXIT_IF(submitted_tick != tick);
-		m_master.Wait(tick);
+		WaitForGpu(tick);
 		BeginNext();
 	} else {
-		m_master.Wait(tick);
+		WaitForGpu(tick);
 	}
 }
 
@@ -370,6 +423,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 
 	m_command.m_buffer = nullptr;
+	m_deferred_slices  = 0;
 	return tick;
 }
 

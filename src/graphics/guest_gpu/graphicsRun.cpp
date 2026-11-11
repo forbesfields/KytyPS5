@@ -206,8 +206,8 @@ void CommandProcessor::BufferInit() {
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
 }
 
-void CommandProcessor::BufferFlush() {
-	GetScheduler().Flush();
+void CommandProcessor::BufferFlush(bool next_slice_ready) {
+	GetScheduler().FlushSlice(next_slice_ready);
 	// The occlusion counters reach a guest that polls them without waiting for a later fence.
 	m_renderer.GetOcclusionQueries().Publish();
 }
@@ -494,8 +494,25 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::Commands:
 			complete =
 			    cp.Process(submission.execution, submission.commands) == Pm4ProcessResult::Complete;
-			if (submission.execution.MadeProgress()) {
-				cp.BufferFlush();
+			if (submission.execution.MadeProgress() ||
+			    m_renderer.GetCommandScheduler().HasDeferredSlices()) {
+				bool next_slice_ready = false;
+				if (complete) {
+					Common::LockGuard lock(m_queue_mutex);
+					const auto& queue = m_queues[submission.queue_id];
+					next_slice_ready = !m_stopping && m_commands.empty() && !queue.empty() &&
+					                   !queue.front().blocked &&
+					                   queue.front().type == SubmissionType::Commands;
+					// The lane selector visits the other queues first. Keep their old boundary.
+					for (uint32_t id = 0; id < QueueCount && next_slice_ready; id++) {
+						if (id != submission.queue_id && !m_queues[id].empty() &&
+						    !m_queues[id].front().blocked) {
+							next_slice_ready = false;
+						}
+					}
+				}
+				// A blocked slice or an empty queue must start its recorded GPU work now.
+				cp.BufferFlush(next_slice_ready);
 			}
 			break;
 		case SubmissionType::FlipPreparation:

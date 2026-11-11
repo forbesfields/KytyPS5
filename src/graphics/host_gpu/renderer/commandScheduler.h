@@ -25,6 +25,14 @@ public:
 	void           EndRendering() { m_command.EndRendering(); }
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
+	// Only a complete slice with another ready slice on the same guest queue can be batched.
+	void           FlushSlice(bool next_slice_ready);
+	[[nodiscard]] bool HasDeferredSlices() const noexcept { return m_deferred_slices != 0; }
+	struct GpuThreadWaitStats {
+		uint64_t count;
+		uint64_t nanoseconds;
+	};
+	[[nodiscard]] static GpuThreadWaitStats GetGpuThreadWaitStats();
 	void           Finish();
 	// At a frame boundary, release driver allocations that live as long as the pool.
 	void           RecreateCommandPool();
@@ -83,6 +91,7 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	void WaitForGpu(uint64_t tick);
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
@@ -94,6 +103,7 @@ private:
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
+	uint32_t                     m_deferred_slices = 0;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

@@ -55334,6 +55334,8 @@ void CheckDeviceCreation() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+#include "FewerSubmitsTests.inc"
+
 // R_FLIP itself publishes the dumped occlusion counters, then flips.
 void CheckPm4Flip() {
   namespace EventQueue = LibKernel::EventQueue;
@@ -56629,6 +56631,10 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--scalar-leaf-call-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckScalarLeafCall();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--fewer-submits-only") == 0) {
+    CheckFewerSubmits();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {
