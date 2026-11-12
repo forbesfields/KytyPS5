@@ -184,6 +184,25 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 
 uint32_t LoadVertexParameter(EmitterState& state, const InputBinding& input, uint32_t vertex,
                              uint32_t chan) {
+	if (state.pv_store.per_vertex_buffer) {
+		const auto pointer = state.builder.AllocateId();
+		const auto address = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassInput, TypeU32(state)), pointer,
+		                          input.variable_id, ConstantU32(state, vertex));
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), address, pointer);
+		const auto offset = Binary(state, spv::OpIAdd, TypeU32(state), address,
+		                           ConstantU32(state, chan & 3u));
+		const auto storage = state.builder.AllocateId();
+		const auto bits = state.builder.AllocateId();
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassStorageBuffer, TypeU32(state)),
+		                          storage, state.mesh_output_buffer, ConstantU32(state, 0u), offset);
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), bits, storage);
+		state.builder.AddFunction(spv::OpBitcast, TypeF32(state), value, bits);
+		return value;
+	}
 	const auto pointer = state.builder.AllocateId();
 	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain,

@@ -4,6 +4,8 @@
 #include "common/emulatorConfig.h"
 #include "common/hostStats.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "imgui.h"
 #include "kernel/memory.h"
 
@@ -14,12 +16,17 @@
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <fmt/format.h>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -29,12 +36,138 @@ using Clock   = std::chrono::steady_clock;
 using Counter = Common::DebugCounters::Counter;
 using Peak    = Common::DebugCounters::Peak;
 
+// Guest flip intervals, independent of the overlay. Keep the samples so the
+// benchmark can compute exact percentiles across several log windows.
+bool PerfLogEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PERF_LOG");
+		const bool on = value != nullptr && std::string_view(value) == "1";
+		Common::DebugCounters::SetPerfEnabled(on);
+		std::printf("KYTY_PERF_LOG=%d\n", on);
+		return on;
+	}();
+	return enabled;
+}
+
+constexpr std::array PERF_COUNTERS {
+	std::pair {Counter::PoolReclaimsDraw, "pool_draw"},
+	std::pair {Counter::PoolReclaimsFrame, "pool_frame"},
+	std::pair {Counter::PoolReclaimsPressure, "pool_pressure"},
+	std::pair {Counter::TessellationDraws, "tess_draws"},
+	std::pair {Counter::TessellationVertices, "tess_vertices"},
+	std::pair {Counter::TessellationIndirectDraws, "tess_indirect_draws"},
+	std::pair {Counter::TessellationPatches, "tess_patch"},
+	std::pair {Counter::TessellationRectangles, "tess_rect"},
+	std::pair {Counter::TessellationCorners, "tess_corner"},
+	std::pair {Counter::CornerFallbackIndirect, "corner_indirect"},
+	std::pair {Counter::CornerFallbackRestart, "corner_restart"},
+	std::pair {Counter::CornerFallbackCaptureRange, "corner_capture_range"},
+	std::pair {Counter::CornerFallbackOutputKind, "corner_output_kind"},
+	std::pair {Counter::CornerFallbackSideEffects, "corner_side_effects"},
+	std::pair {Counter::CornerFallbackSwitchOff, "corner_switch_off"},
+	std::pair {Counter::CornerFallbackOther, "corner_other"},
+	std::pair {Counter::VsStoreNativeDraws, "vs_store_native"},
+	std::pair {Counter::MeshBufferDraws, "mesh_buffer"},
+};
+using PerfCounterTotals = std::array<uint64_t, static_cast<size_t>(Counter::Count)>;
+
+PerfCounterTotals ReadPerfCounters() {
+	PerfCounterTotals result {};
+	for (size_t i = 0; i < result.size(); ++i) {
+		result[i] = Common::DebugCounters::Get(static_cast<Counter>(i));
+	}
+	return result;
+}
+
+struct PerfLog {
+	std::mutex          mutex;
+	Clock::time_point   start {};
+	Clock::time_point   window_start {};
+	Clock::time_point   last_flip {};
+	uint64_t            total_frames = 0;
+	std::vector<double> intervals_ms;
+	PerfCounterTotals   counter_totals {};
+
+	void Record() {
+		std::scoped_lock lock(mutex);
+		const auto now = Clock::now();
+		if (last_flip == Clock::time_point {}) {
+			start = window_start = now;
+			counter_totals = ReadPerfCounters();
+		} else {
+			intervals_ms.push_back(std::chrono::duration<double, std::milli>(now - last_flip).count());
+		}
+		last_flip = now;
+		total_frames++;
+	}
+
+	void Print() {
+		std::unique_lock lock(mutex);
+		const auto now = Clock::now();
+		if (start == Clock::time_point {} || now - window_start < std::chrono::seconds(5)) {
+			return;
+		}
+		const double seconds = std::chrono::duration<double>(now - window_start).count();
+		const double elapsed = std::chrono::duration<double>(now - start).count();
+		const double unix_s = std::chrono::duration<double>(
+		    std::chrono::system_clock::now().time_since_epoch()).count();
+		const auto frames = total_frames;
+		const auto totals = ReadPerfCounters();
+		const auto previous = counter_totals;
+		counter_totals = totals;
+		std::vector<double> samples;
+		samples.swap(intervals_ms);
+		window_start = now;
+		// Sort and write outside the flip lock. Log I/O must not block a frame.
+		lock.unlock();
+		const auto driver_bytes = RenderContext::ReadPerfDriverBytes();
+		double sum = 0.0;
+		for (double ms: samples) {
+			sum += ms;
+		}
+		std::sort(samples.begin(), samples.end());
+		const size_t count = samples.size();
+		const double mean = count == 0 ? 0.0 : sum / count;
+		const double median = count == 0 ? 0.0 :
+		    (samples[(count - 1) / 2] + samples[count / 2]) * 0.5;
+		const double p95 = count == 0 ? 0.0 : samples[(count * 95 + 99) / 100 - 1];
+		std::string line = fmt::format(
+		    "KYTY_PERF {{\"v\":1,\"source\":\"guest_flip\",\"elapsed_s\":{:.6f},"
+		    "\"unix_s\":{:.6f},\"window_s\":{:.6f},\"frames\":{},\"total_frames\":{},"
+		    "\"fps\":{:.6f},\"mean_ms\":{:.6f},\"median_ms\":{:.6f},\"p95_ms\":{:.6f},\"frame_ms\":[",
+		    elapsed, unix_s, seconds, count, frames, count / seconds, mean, median, p95);
+		for (size_t i = 0; i < count; i++) {
+			if (i != 0) {
+				line += ',';
+			}
+			line += fmt::format("{:.6f}", samples[i]);
+		}
+		line += ']';
+		for (const auto& [counter, name]: PERF_COUNTERS) {
+			const auto index = static_cast<size_t>(counter);
+			line += fmt::format(",\"{}\":{}", name, totals[index] - previous[index]);
+		}
+		const auto timing = static_cast<size_t>(Counter::PoolRecreateNs);
+		line += fmt::format(",\"pool_recreate_ms\":{:.6f},\"driver_mib\":{}}}\n",
+		    static_cast<double>(totals[timing] - previous[timing]) / 1e6,
+		    driver_bytes ? fmt::format("{:.6f}", static_cast<double>(*driver_bytes) / (1024 * 1024))
+		                 : "null");
+		std::fwrite(line.data(), 1, line.size(), stdout);
+		std::fflush(stdout);
+	}
+};
+
+PerfLog g_perf_log;
+
 constexpr auto   REFRESH_INTERVAL  = std::chrono::seconds(1);
 constexpr size_t FRAME_HISTORY     = 120;
 constexpr float  FRAME_GRAPH_MS    = 50.0f;
 constexpr float  FRAME_TIME_GOOD   = 17.5f;
 constexpr float  FRAME_TIME_MEDIUM = 34.0f;
-constexpr size_t COUNTER_COUNT     = static_cast<size_t>(Counter::Count);
+// Scheduler waits exclude the background completion runner and other host threads.
+constexpr size_t GPU_THREAD_WAITS   = static_cast<size_t>(Counter::Count);
+constexpr size_t GPU_THREAD_WAIT_NS = GPU_THREAD_WAITS + 1;
+constexpr size_t COUNTER_COUNT     = GPU_THREAD_WAIT_NS + 1;
 constexpr auto   HITCH_WINDOW      = std::chrono::seconds(10);
 // At least 50 ms per hitch means at most 200 can finish in a ten-second window.
 constexpr size_t HITCH_HISTORY     = 256;
@@ -43,9 +176,12 @@ using CounterTotals = std::array<uint64_t, COUNTER_COUNT>;
 
 CounterTotals ReadCounters() {
 	CounterTotals totals {};
-	for (size_t i = 0; i < totals.size(); i++) {
+	for (size_t i = 0; i < static_cast<size_t>(Counter::Count); i++) {
 		totals[i] = Common::DebugCounters::Get(static_cast<Counter>(i));
 	}
+	const auto waits = CommandScheduler::GetGpuThreadWaitStats();
+	totals[GPU_THREAD_WAITS] = waits.count;
+	totals[GPU_THREAD_WAIT_NS] = waits.nanoseconds;
 	return totals;
 }
 
@@ -181,7 +317,7 @@ void SamplerThread(const std::stop_token& stop) {
 	uint64_t                                sampled_generation = 0;
 	std::unique_lock                        lock(g_host_mutex);
 	while (!stop.stop_requested()) {
-		g_sampler_wait.wait(lock, stop, [] { return Common::DebugCounters::Enabled(); });
+		g_sampler_wait.wait(lock, stop, [] { return Common::DebugCounters::Enabled() || PerfLogEnabled(); });
 		if (stop.stop_requested()) {
 			break;
 		}
@@ -192,6 +328,9 @@ void SamplerThread(const std::stop_token& stop) {
 			sampled_generation = generation;
 		}
 		auto stats = sampler->Sample();
+		if (PerfLogEnabled()) {
+			g_perf_log.Print();
+		}
 		lock.lock();
 		g_host_stats      = std::move(stats);
 		g_host_generation = generation;
@@ -199,7 +338,7 @@ void SamplerThread(const std::stop_token& stop) {
 			g_revision.fetch_add(1, std::memory_order_acq_rel);
 		}
 		g_sampler_wait.wait_for(lock, stop, REFRESH_INTERVAL, [generation] {
-			return !Common::DebugCounters::Enabled() ||
+			return (!Common::DebugCounters::Enabled() && !PerfLogEnabled()) ||
 			       generation != g_generation.load(std::memory_order_acquire);
 		});
 	}
@@ -375,8 +514,30 @@ void TransferRow(const Snapshot& shown, const char* label, Counter upload, Count
 void GpuActivityRows(const Snapshot& shown) {
 	const auto draws = Rate(shown, Counter::Draws);
 	Row("Draw calls", Fmt("%.0f/frame  %.0f/s", draws / std::max(shown.fps, 1.0), draws));
-	// Includes present pacing waits, so a high value alone is not a stall.
-	Row("CPU waiting on GPU",
+	const auto submits = Rate(shown, Counter::QueueSubmits);
+	Row("Queue submits", shown.frame_count > 0
+	                         ? Fmt("%.1f/frame  %.0f/s",
+	                               static_cast<double>(shown.deltas[static_cast<size_t>(Counter::QueueSubmits)]) /
+	                                   shown.frame_count,
+	                               submits)
+	                         : Fmt("n/a per frame  %.0f/s", submits));
+	Row("GPU thread scheduler waits",
+	    Fmt("%.0f ms/s  (%.0f waits/s)", shown.rates[GPU_THREAD_WAIT_NS] / 1e6,
+	        shown.rates[GPU_THREAD_WAITS]));
+	const auto per_frame = [&](Counter counter) {
+		return Rate(shown, counter) / std::max(shown.fps, 1.0);
+	};
+	Row("Render / compute / buffer blit",
+	    Fmt("%.0f / %.0f / %.0f per frame", per_frame(Counter::RenderPassStarts),
+	        per_frame(Counter::ComputePasses), per_frame(Counter::BufferBlits)));
+	Row("Pass merges / in-pass clears",
+	    Fmt("%.0f / %.0f per frame", per_frame(Counter::RenderPassMerges),
+	        per_frame(Counter::InPassClears)));
+	// MoltenVK 1.4.2 maps STORE_OP_NONE to STORE (mvk_datatypes.mm:598).
+	// Count requests; this does not prove that the driver skipped a store.
+	Row("Store-none requested", Fmt("%.0f/frame", per_frame(Counter::AttachmentStoresSkipped)));
+	// Includes the background completion runner and present pacing waits.
+	Row("All-thread GPU timeline waits",
 	    Fmt("%.0f ms/s  (%.0f waits/s)", Rate(shown, Counter::GpuWaitNs) / 1e6,
 	        Rate(shown, Counter::GpuWaits)));
 	Row("DCC/CMASK readbacks",
@@ -414,7 +575,8 @@ void FrameTimingRows(const Snapshot& shown) {
 	};
 	row("Guest GPU / compile", ms(Counter::GpuThreadBusyNs),
 	    ms(Counter::ShaderCompileNs) + ms(Counter::PipelineCreateNs));
-	row("GPU wait / present", ms(Counter::GpuWaitNs), ms(Counter::PresentNs));
+	row("GPU thread wait / present",
+	    static_cast<double>(shown.deltas[GPU_THREAD_WAIT_NS]) / 1e6, ms(Counter::PresentNs));
 	row("Acquire / overlay", ms(Counter::PresentAcquireNs), ms(Counter::OverlayNs));
 }
 
@@ -429,7 +591,7 @@ std::string HitchActivity(const Hitch& hitch) {
 	};
 	std::array activity {
 	    Activity {"compile", ms(Counter::ShaderCompileNs) + ms(Counter::PipelineCreateNs)},
-	    Activity {"GPU wait", ms(Counter::GpuWaitNs)},
+	    Activity {"GPU thread wait", static_cast<double>(hitch.deltas[GPU_THREAD_WAIT_NS]) / 1e6},
 	    Activity {"readback", ms(Counter::ColorMetadataReadbackNs)},
 	    Activity {"acquire", ms(Counter::PresentAcquireNs)},
 	    Activity {"overlay", ms(Counter::OverlayNs)},
@@ -467,8 +629,9 @@ void Refresh(Snapshot& shown, const GraphicContext& graphics, Clock::time_point 
 	const double seconds = shown.sample_time == Clock::time_point {}
 	                           ? 0.0
 	                           : std::chrono::duration<double>(now - shown.sample_time).count();
+	const auto totals = ReadCounters();
 	for (size_t i = 0; i < COUNTER_COUNT; i++) {
-		const auto value = Common::DebugCounters::Get(static_cast<Counter>(i));
+		const auto value = totals[i];
 		shown.deltas[i] = seconds > 0.0 ? value - shown.totals[i] : 0;
 		shown.rates[i] =
 		    seconds > 0.0 ? static_cast<double>(shown.deltas[i]) / seconds : 0.0;
@@ -746,6 +909,10 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 } // namespace
 
 void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept {
+	if (PerfLogEnabled()) {
+		g_perf_log.Record();
+		EnsureSampler();
+	}
 	if (!Common::DebugCounters::Enabled()) {
 		return;
 	}

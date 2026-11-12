@@ -203,11 +203,12 @@ void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operatio
 }
 
 void CommandProcessor::BufferInit() {
+	m_draws = 0;
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
 }
 
-void CommandProcessor::BufferFlush() {
-	GetScheduler().Flush();
+void CommandProcessor::BufferFlush(bool next_slice_ready) {
+	GetScheduler().FlushSlice(next_slice_ready);
 	// The occlusion counters reach a guest that polls them without waiting for a later fence.
 	m_renderer.GetOcclusionQueries().Publish();
 }
@@ -486,6 +487,13 @@ void GuestGpu::ThreadRun(void* data) {
 
 bool GuestGpu::Process(Submission& submission) {
 	auto& cp = GetProcessor(submission.queue_id);
+	auto& scheduler = m_renderer.GetCommandScheduler();
+	// Another queue can become ready after the previous slice checks its successor.
+	if (scheduler.HasDeferredSlices() &&
+	    (&scheduler.Current().GetRegisters() != &cp.GetCtx() ||
+	     submission.type != SubmissionType::Commands)) {
+		scheduler.Flush();
+	}
 
 	cp.BufferInit();
 	bool complete = true;
@@ -494,8 +502,24 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::Commands:
 			complete =
 			    cp.Process(submission.execution, submission.commands) == Pm4ProcessResult::Complete;
-			if (submission.execution.MadeProgress()) {
-				cp.BufferFlush();
+			if (submission.execution.MadeProgress() || scheduler.HasDeferredSlices()) {
+				bool next_slice_ready = false;
+				if (complete) {
+					Common::LockGuard lock(m_queue_mutex);
+					const auto& queue = m_queues[submission.queue_id];
+					next_slice_ready = !m_stopping && m_commands.empty() && !queue.empty() &&
+					                   !queue.front().blocked &&
+					                   queue.front().type == SubmissionType::Commands;
+					// The lane selector visits the other queues first. Keep their old boundary.
+					for (uint32_t id = 0; id < QueueCount && next_slice_ready; id++) {
+						if (id != submission.queue_id && !m_queues[id].empty() &&
+						    !m_queues[id].front().blocked) {
+							next_slice_ready = false;
+						}
+					}
+				}
+				// A blocked slice or an empty queue must start its recorded GPU work now.
+				cp.BufferFlush(next_slice_ready);
 			}
 			break;
 		case SubmissionType::FlipPreparation:
@@ -704,7 +728,20 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
+// Submits the recorded work every N draws so the host GPU starts before a long buffer ends.
+void CommandProcessor::CountDraw() {
+	if (m_flush_draws == 0) {
+		return;
+	}
+	if (m_draws == m_flush_draws) {
+		GetScheduler().Flush();
+		m_draws = 0;
+	}
+	m_draws++;
+}
+
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+	CountDraw();
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
@@ -765,17 +802,11 @@ static bool IndirectDrawOffsets(IndirectDrawRegisters registers, ShaderIndirectO
 	return true;
 }
 
-void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
-                                    uint32_t draw_initiator, bool indexed) {
-	const auto args_size =
-	    indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
-	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
-}
-
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, IndirectDrawRegisters registers,
                                          uint32_t draw_initiator, bool indexed) {
+	CountDraw();
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 	// The guest records match Vulkan's indirect commands byte for byte.
@@ -864,6 +895,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+	CountDraw();
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
 	}

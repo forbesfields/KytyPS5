@@ -1,6 +1,7 @@
 #pragma once
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/triangleShader.h"
 
 #include <cstdint>
 #include <vector>
@@ -12,6 +13,19 @@ namespace Libs::Graphics {
 inline constexpr uint32_t MeshEmulationBinding = 255u;
 static_assert(MeshEmulationBinding >= 4u *
     static_cast<uint32_t>(ShaderRecompiler::IR::DescriptorBindingKind::Count));
+
+// The switch is read and logged once. A full push layout reads its header from storage.
+[[nodiscard]] bool MeshEmulationBatchEnabled();
+[[nodiscard]] uint32_t MeshEmulationHeaderDword(uint32_t user_clip_planes);
+
+struct MeshEmulationBatch {
+    uint32_t groups = 0;
+    uint32_t instances = 0;
+};
+
+[[nodiscard]] MeshEmulationBatch PlanMeshEmulationBatch(
+    uint32_t groups, uint32_t instances, uint64_t capacity,
+    uint32_t max_groups, uint32_t max_instances);
 
 struct MeshEmulationField {
     ShaderRecompiler::IR::StageOutput output;
@@ -38,6 +52,11 @@ struct MeshEmulationLayout {
     const ShaderVertexInputInfo& input);
 
 [[nodiscard]] std::vector<uint32_t> BuildMeshEmulationVertexShader(
-    const MeshEmulationLayout& layout, uint32_t provoking_vertex);
+    const MeshEmulationLayout& layout, uint32_t provoking_vertex,
+    std::span<const TriangleParameter> corner_parameters = {});
+
+[[nodiscard]] std::vector<uint32_t> BuildVertexStoreVertexShader(
+    const MeshEmulationLayout& layout, uint32_t provoking_vertex,
+    std::span<const TriangleParameter> parameters);
 
 } // namespace Libs::Graphics

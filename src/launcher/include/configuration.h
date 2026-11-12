@@ -84,6 +84,9 @@ public:
 	enum class LogDirection { Silent, Console, File };
 	Q_ENUM(LogDirection)
 
+	enum class PssrUpscaler { Linear, DLSS };
+	Q_ENUM(PssrUpscaler)
+
 	enum class GameStatus { Unknown, InGame, Logo, DoesntBoot, MainMenu };
 	Q_ENUM(GameStatus)
 
@@ -113,12 +116,14 @@ public:
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
+	bool                   output_1080p_enabled        = false;
 	bool                   hide_cursor_enabled         = false;
 	bool                   stretch_enabled             = false;
 	bool                   readback_linear_images      = false;
 	bool                   readback_tiled_images       = false;
 	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
+	int                    flush_draws                 = 0;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   relaxed_shader_float        = false;
@@ -142,6 +147,8 @@ public:
 	bool                   profiler_enabled            = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   pro_enabled                 = false;
+	PssrUpscaler           pssr_upscaler               = PssrUpscaler::Linear;
+	QString                dlss_folder;
 	bool                   amd_cpu_enabled             = false;
 	bool                   guest_tsc_enabled           = false;
 #if defined(_WIN32)
@@ -160,12 +167,14 @@ public:
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hdr_enabled                 = other.hdr_enabled;
+		output_1080p_enabled        = other.output_1080p_enabled;
 		hide_cursor_enabled         = other.hide_cursor_enabled;
 		stretch_enabled             = other.stretch_enabled;
 		readback_linear_images      = other.readback_linear_images;
 		readback_tiled_images       = other.readback_tiled_images;
 		readback_storage_images     = other.readback_storage_images;
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
+		flush_draws                 = other.flush_draws;
 		tessellation_enabled        = other.tessellation_enabled;
 		occlusion_queries_enabled   = other.occlusion_queries_enabled;
 		relaxed_shader_float        = other.relaxed_shader_float;
@@ -189,6 +198,8 @@ public:
 		profiler_enabled            = other.profiler_enabled;
 		renderdoc_enabled           = other.renderdoc_enabled;
 		pro_enabled                 = other.pro_enabled;
+		pssr_upscaler               = other.pssr_upscaler;
+		dlss_folder                 = other.dlss_folder;
 		amd_cpu_enabled             = other.amd_cpu_enabled;
 		guest_tsc_enabled           = other.guest_tsc_enabled;
 #if defined(_WIN32)

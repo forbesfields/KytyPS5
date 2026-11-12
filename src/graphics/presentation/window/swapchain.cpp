@@ -21,8 +21,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <limits>
 #include <memory>
+#include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -429,6 +431,14 @@ void Swapchain::Create() {
 	create_info.imageSharingMode = vk::SharingMode::eExclusive;
 	create_info.preTransform     = transform;
 	create_info.compositeAlpha   = composite;
+#if defined(__APPLE__)
+	static const bool immediate_fallback = [] {
+		const char* value = std::getenv("KYTY_PERF_IMMEDIATE_PRESENT");
+		const bool enabled = value == nullptr || std::string_view(value) != "0";
+		LOGF("KYTY_PERF_IMMEDIATE_PRESENT=%d\n", enabled);
+		return enabled;
+	}();
+#endif
 	switch (Config::GetPresentMode()) {
 		case Config::PresentMode::Mailbox:
 			create_info.presentMode = vk::PresentModeKHR::eMailbox;
@@ -441,9 +451,22 @@ void Swapchain::Create() {
 	}
 	if (std::find(surface.present_modes.begin(), surface.present_modes.end(),
 	              create_info.presentMode) == surface.present_modes.end()) {
-		LOGF("warning: requested present mode is unavailable; falling back to Fifo\n");
-		create_info.presentMode = vk::PresentModeKHR::eFifo;
+#if defined(__APPLE__)
+		// MoltenVK has no Mailbox mode. It sets CAMetalLayer.displaySyncEnabled
+		// from this mode, so a separate native layer override is not needed.
+		if (immediate_fallback && Config::GetPresentMode() == Config::PresentMode::Mailbox &&
+		    std::find(surface.present_modes.begin(), surface.present_modes.end(),
+		              vk::PresentModeKHR::eImmediate) != surface.present_modes.end()) {
+			LOGF("warning: Mailbox is unavailable; using Immediate\n");
+			create_info.presentMode = vk::PresentModeKHR::eImmediate;
+		} else
+#endif
+		{
+			LOGF("warning: requested present mode is unavailable; falling back to Fifo\n");
+			create_info.presentMode = vk::PresentModeKHR::eFifo;
+		}
 	}
+	LOGF("Vulkan present mode: %s\n", vk::to_string(create_info.presentMode).c_str());
 	create_info.clipped = VK_TRUE;
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");

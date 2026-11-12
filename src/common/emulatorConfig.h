@@ -61,11 +61,15 @@ struct ConfigOptions {
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
+	bool                   output_1080p_enabled        = false;
 	bool                   hide_cursor_enabled         = false;
 	bool                   stretch_enabled             = false;
 	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
 	bool                   pro_enabled                 = false;
+	// Folder with the user's DLSS model; DLSS upscales PSSR in Pro mode when set.
+	std::filesystem::path  dlss_folder;
+	uint32_t               dlss_preset                 = 0; // 0 is the model default
 	bool                   amd_cpu_enabled             = false;
 	bool                   guest_tsc_enabled           = false;
 	bool                   network_connected           = false;
@@ -90,6 +94,7 @@ struct ConfigOptions {
 	bool                   readback_tiled_images       = false;
 	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
+	uint32_t               flush_draws                 = 0; // 0 is off
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   relaxed_shader_float        = false;
@@ -128,10 +133,15 @@ PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     HdrEnabled();
+bool     Output1080pEnabled();
+// PS5 VideoOut resolution codes: 1 = 1920x1080, 2 = 3840x2160.
+uint32_t GetVideoOutResolution(uint32_t width, uint32_t height, uint32_t attribute3);
 bool     HideCursorEnabled();
 bool     StretchEnabled();
 bool     VrEnabled();
 bool     Ps5ProEnabled();
+const std::filesystem::path& GetDlssFolder();
+uint32_t GetDlssPreset();
 bool     AmdCpuEnabled();
 bool     GuestTscEnabled();
 bool     IsNetworkConnected();
@@ -164,6 +174,7 @@ bool ReadbackLinearImagesEnabled();
 bool ReadbackTiledImagesEnabled();
 bool ReadbackStorageImagesEnabled();
 bool SyncRawImageBuffersEnabled();
+uint32_t GetFlushDraws();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();

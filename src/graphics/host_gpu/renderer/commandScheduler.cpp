@@ -2,39 +2,158 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/logging/log.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/gpuCacheBudget.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 
 namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
-CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
-    : m_graphics(graphics), m_master(master) {
-	Recreate();
+// Opt-in: with the ring on, Astro Bot loses the Metal device ("Invalid Resource") about 30 s
+// after launch. The ring destroys a finished pool while later Metal work can still run.
+static bool UsePoolRing() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PERF_POOL_RING");
+		const bool use_ring = value != nullptr && std::strcmp(value, "1") == 0;
+		Log::WriteToConsoleAndLog(fmt::format("KYTY_PERF_POOL_RING={} (default: 0)\n", use_ring ? 1 : 0));
+		return use_ring;
+	}();
+	return enabled;
 }
 
-void CommandScheduler::CommandPool::Recreate() {
+namespace {
+std::atomic<uint64_t> g_gpu_thread_wait_count {0};
+std::atomic<uint64_t> g_gpu_thread_wait_ns {0};
+
+bool FewerSubmitsEnabled() {
+	static const bool enabled = [] {
+		const auto* value  = std::getenv("KYTY_PERF_FEWER_SUBMITS");
+		const bool active = value == nullptr || std::strcmp(value, "0") != 0;
+		Log::WriteToConsoleAndLog(active ? "KYTY_PERF_FEWER_SUBMITS=1 (default on)\n"
+		                                : "KYTY_PERF_FEWER_SUBMITS=0 (legacy slice flushes)\n");
+		return active;
+	}();
+	return enabled;
+}
+} // namespace
+
+CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master, bool use_ring)
+    : m_graphics(graphics), m_master(master), m_use_ring(use_ring), m_pool(CreatePool()) {}
+
+vk::CommandPool CommandScheduler::CommandPool::CreatePool() {
 	EXIT_IF(m_graphics.queue_family == static_cast<uint32_t>(-1));
 	vk::CommandPoolCreateInfo create {};
 	create.queueFamilyIndex = m_graphics.queue_family;
 	create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
 	                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
-	vk::CommandPool replacement;
-	const auto result = m_graphics.device.createCommandPool(&create, nullptr, &replacement);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || replacement == nullptr);
-	if (m_pool != nullptr) {
+	vk::CommandPool pool;
+	const auto result = m_graphics.device.createCommandPool(&create, nullptr, &pool);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pool == nullptr);
+	return pool;
+}
+
+vk::Fence CommandScheduler::CommandPool::CompletionCheckpoint() {
+	vk::FenceCreateInfo create {};
+	vk::Fence fence;
+	EXIT_IF(m_graphics.device.createFence(&create, nullptr, &fence) != vk::Result::eSuccess);
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		// A fence-only submit follows all uses of this pool. MoltenVK signals its fence
+		// from the Metal completion handler, after temporary allocations return to pools.
+		// Its native timeline event alone does not protect those host callbacks.
+		const auto result = m_graphics.queue.submit(0, static_cast<const vk::SubmitInfo*>(nullptr), fence);
+		EXIT_IF(result != vk::Result::eSuccess);
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+	return fence;
+}
+
+void CommandScheduler::CommandPool::WaitCheckpoint(vk::Fence fence) {
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
+	                                         Common::DebugCounters::Counter::GpuWaitNs);
+	uint64_t seconds = 0;
+	for (;;) {
+		const auto result = m_graphics.device.waitForFences(1, &fence, VK_TRUE, 1'000'000'000);
+		if (result == vk::Result::eSuccess) {
+			return;
+		}
+		EXIT_IF(result != vk::Result::eTimeout);
+		if (++seconds == 5 || seconds % 30 == 0) {
+			Log::WriteToConsoleAndLog(fmt::format("Command pool host completion fence pending for {} s\n", seconds));
+		}
+	}
+}
+
+void CommandScheduler::CommandPool::DestroyRetiredPool() {
+	const auto& retired = m_retired_pools.front();
+	m_graphics.device.destroyCommandPool(retired.pool, nullptr);
+	m_graphics.device.destroyFence(retired.fence, nullptr);
+	m_retired_pools.pop();
+}
+
+void CommandScheduler::CommandPool::ReleaseCompletedPools(bool frame_boundary, bool need_space) {
+	if (frame_boundary) {
+		++m_frame;
+	}
+	if (m_retired_pools.empty()) {
+		return;
+	}
+	m_master.Refresh();
+	while (!m_retired_pools.empty()) {
+		const auto& retired = m_retired_pools.front();
+		const auto status = m_graphics.device.getFenceStatus(retired.fence);
+		EXIT_IF(status != vk::Result::eSuccess && status != vk::Result::eNotReady);
+		const auto action = CommandPoolRetirementBudget::Poll(
+		    retired.tick, m_master.KnownGpuTick(), status == vk::Result::eSuccess,
+		    need_space ? m_retired_pools.size() : 0, m_frame - retired.frame);
+		if (action == CommandPoolRetirementAction::Pending) {
+			return;
+		}
+		if (action == CommandPoolRetirementAction::Wait) {
+			// Bound both pool count and age. Do not wait for newer queue work.
+			m_master.Wait(retired.tick);
+			WaitCheckpoint(retired.fence);
+		}
+		DestroyRetiredPool();
+	}
+}
+
+void CommandScheduler::CommandPool::Recreate() {
+	if (m_use_ring) {
+		ReleaseCompletedPools(false, true);
+		const auto fence = CompletionCheckpoint();
+		m_retired_pools.push({m_pool, fence, m_master.CurrentTick() - 1, m_frame});
+	} else {
+		// The legacy caller has drained the queue.
 		m_graphics.device.destroyCommandPool(m_pool, nullptr);
 	}
-	m_pool = replacement;
+	m_pool = CreatePool();
 	m_buffers.clear();
 	m_ticks.clear();
 	m_hint = 0;
 }
 
 CommandScheduler::CommandPool::~CommandPool() {
+	// Shutdown has submitted the final recording. Cover its host completion handlers
+	// as well as the GPU timeline before destroying the active and retired pools.
+	if (m_use_ring) {
+		const auto fence = CompletionCheckpoint();
+		WaitCheckpoint(fence);
+		m_graphics.device.destroyFence(fence, nullptr);
+		while (!m_retired_pools.empty()) {
+			WaitCheckpoint(m_retired_pools.front().fence);
+			DestroyRetiredPool();
+		}
+	}
 	m_graphics.device.destroyCommandPool(m_pool, nullptr);
 }
 
@@ -87,9 +206,11 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 }
 
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
-    : m_master(graphics), m_context(context), m_graphics(graphics),
-      m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+    : m_master(graphics), m_context(context), m_graphics(graphics), m_pool_ring_enabled(UsePoolRing()),
+      m_command_pool(graphics, m_master, m_pool_ring_enabled), m_command(*this),
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	FewerSubmitsEnabled();
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -158,27 +279,62 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 	BeginNext();
 }
 
+void CommandScheduler::FlushSlice(bool next_slice_ready) {
+	// Bound each batch to four slices so a long queue still starts GPU work early. Flips,
+	// readbacks, waits and explicit Flush calls submit at their original boundaries.
+	if (FewerSubmitsEnabled() && next_slice_ready && m_deferred_slices < 3) {
+		std::lock_guard lock(m_operation_mutex);
+		const auto tick = CurrentTick();
+		// Older completions already have a submit. Only this recording needs to start now.
+		if (m_priority_active_tick < tick &&
+		    (m_priority_operations.empty() || m_priority_operations.back().tick < tick)) {
+			m_deferred_slices++;
+			return;
+		}
+	}
+	Flush();
+}
+
+CommandScheduler::GpuThreadWaitStats CommandScheduler::GetGpuThreadWaitStats() {
+	return {g_gpu_thread_wait_count.load(std::memory_order_relaxed),
+	        g_gpu_thread_wait_ns.load(std::memory_order_relaxed)};
+}
+
+void CommandScheduler::WaitForGpu(uint64_t tick) {
+	if (!GuestGpu::IsGpuThread() || !Common::DebugCounters::Enabled() || IsFree(tick)) {
+		m_master.Wait(tick);
+		return;
+	}
+	const auto start = std::chrono::steady_clock::now();
+	m_master.Wait(tick);
+	const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                         std::chrono::steady_clock::now() - start).count();
+	g_gpu_thread_wait_count.fetch_add(1, std::memory_order_relaxed);
+	g_gpu_thread_wait_ns.fetch_add(static_cast<uint64_t>(elapsed), std::memory_order_relaxed);
+}
+
 void CommandScheduler::Finish() {
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	WaitForGpu(CurrentTick() - 1);
 	BeginNext();
 	PopPendingOperations();
 }
 
 void CommandScheduler::RecreateCommandPool() {
+	const Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PoolRecreateNs);
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	{
+	if (!m_pool_ring_enabled) {
 		Common::LockGuard lock(m_graphics.queue_mutex);
 		const auto result = m_graphics.queue.waitIdle();
 		EXIT_IF(result != vk::Result::eSuccess);
 	}
-	// MoltenVK retains its temporary Metal buffers until the pool is destroyed.
+	// Reset and trim do not release MoltenVK 1.4.2's temporary Metal allocators.
 	m_command_pool.Recreate();
 	BeginNext();
 	PopPendingOperations();
@@ -193,15 +349,20 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// resources are released only at the next GPU operation boundary.
 		const auto submitted_tick = Submit();
 		EXIT_IF(submitted_tick != tick);
-		m_master.Wait(tick);
+		WaitForGpu(tick);
 		BeginNext();
 	} else {
-		m_master.Wait(tick);
+		WaitForGpu(tick);
 	}
+}
+
+void CommandScheduler::AdvanceCommandPoolFrame() {
+	m_command_pool.ReleaseCompletedPools(true);
 }
 
 void CommandScheduler::PopPendingOperations() {
 	m_master.Refresh();
+	m_command_pool.ReleaseCompletedPools();
 	for (;;) {
 		PendingOperation operation;
 		{
@@ -370,6 +531,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 
 	m_command.m_buffer = nullptr;
+	m_deferred_slices  = 0;
 	return tick;
 }
 

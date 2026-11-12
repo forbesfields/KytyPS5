@@ -270,12 +270,14 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	AddFlag(args, info.fullscreen_enabled, "--fullscreen");
 	AddFlag(args, info.hdr_enabled, "--hdr");
+	AddFlag(args, info.output_1080p_enabled, "--output-1080p");
 	AddFlag(args, info.hide_cursor_enabled, "--hide-cursor");
 	AddFlag(args, info.stretch_enabled, "--stretch");
 	AddFlag(args, info.readback_linear_images, "--readback-linear-images");
 	AddFlag(args, info.readback_tiled_images, "--readback-tiled-images");
 	AddFlag(args, info.readback_storage_images, "--readback-storage-images");
 	AddFlag(args, info.sync_raw_image_buffers, "--sync-raw-image-buffers");
+	args << "--flush-draws" << QString::number(info.flush_draws);
 	AddFlag(args, !info.trophy_enabled, "--no-trophy-notifications");
 	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
 	AddFlag(args, info.perf_overlay_enabled, "--perf-overlay");
@@ -298,6 +300,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--printf-output-file" << info.printf_output_file;
 	AddFlag(args, info.profiler_enabled, "--profile");
 	AddFlag(args, info.pro_enabled, "--trinity");
+	if (info.pro_enabled && info.pssr_upscaler == Configuration::PssrUpscaler::DLSS) {
+		args << "--dlss" << info.dlss_folder;
+	}
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
 	AddFlag(args, info.guest_tsc_enabled, "--guest-tsc");
 #if defined(_WIN32)

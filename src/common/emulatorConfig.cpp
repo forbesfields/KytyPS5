@@ -2,17 +2,26 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/logging/log.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 
 namespace Config {
 
 static std::unique_ptr<ConfigOptions> g_config;
+static bool g_output_1080p_allowed = true;
 
 void Initialize() {
 	EXIT_IF(g_config != nullptr);
 
+	const char* output_1080p = std::getenv("KYTY_PERF_OUTPUT_1080P");
+	g_output_1080p_allowed = output_1080p == nullptr || std::strcmp(output_1080p, "0") != 0;
+	Log::WriteToConsoleAndLog(g_output_1080p_allowed
+	                             ? "[VideoOut] KYTY_PERF_OUTPUT_1080P=1 (option allowed)\n"
+	                             : "[VideoOut] KYTY_PERF_OUTPUT_1080P=0 (option disabled)\n");
 	g_config = std::make_unique<ConfigOptions>();
 }
 
@@ -101,6 +110,17 @@ bool HdrEnabled() {
 	return g_config->hdr_enabled;
 }
 
+bool Output1080pEnabled() {
+	return g_config->output_1080p_enabled && g_output_1080p_allowed;
+}
+
+uint32_t GetVideoOutResolution(uint32_t width, uint32_t height, uint32_t attribute3) {
+	// Keep the title's resolution-detection permission unless the user overrides it.
+	return Output1080pEnabled() || ((attribute3 & 4u) != 0 && width < 3840 && height < 2160)
+	           ? 1u
+	           : 2u;
+}
+
 bool HideCursorEnabled() {
 	return g_config->hide_cursor_enabled;
 }
@@ -115,6 +135,14 @@ bool VrEnabled() {
 
 bool Ps5ProEnabled() {
 	return g_config->pro_enabled;
+}
+
+const std::filesystem::path& GetDlssFolder() {
+	return g_config->dlss_folder;
+}
+
+uint32_t GetDlssPreset() {
+	return g_config->dlss_preset;
 }
 
 bool AmdCpuEnabled() {
@@ -211,6 +239,10 @@ bool ReadbackStorageImagesEnabled() {
 
 bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
+}
+
+uint32_t GetFlushDraws() {
+	return g_config->flush_draws;
 }
 
 bool TessellationEnabled() {

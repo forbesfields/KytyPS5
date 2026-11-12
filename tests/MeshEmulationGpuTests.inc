@@ -1,3 +1,10 @@
+struct MeshGpuBatchCase {
+  uint32_t groups, instances, capacity, max_groups, max_instances;
+  uint32_t expected_batches;
+  bool legacy = false;
+  uint32_t user_clip_planes = 0u;
+};
+
 // A small portability harness: no mesh shaders, native null descriptors or int64 atomics.
 class MeshGpuTest {
 public:
@@ -41,6 +48,8 @@ public:
     vk::PhysicalDeviceFeatures core{};
     core.tessellationShader = true;
     core.shaderInt64 = true;
+    core.vertexPipelineStoresAndAtomics = true;
+    core.shaderClipDistance = clip_distance = physical.getFeatures().shaderClipDistance;
     vk::PhysicalDeviceVulkan12Features features12{.scalarBlockLayout = true};
     vk::PhysicalDeviceVulkan13Features features13{.pNext = &features12,
       .synchronization2 = true, .dynamicRendering = true};
@@ -66,12 +75,15 @@ public:
     instance.destroy();
   }
 
-  void Render(const std::vector<uint32_t>& compute, const MeshEmulationLayout& layout,
+  std::vector<uint8_t> Render(const std::vector<uint32_t>& compute, const MeshEmulationLayout& layout,
               const std::vector<uint32_t>& vertex, const std::vector<uint32_t>& fragment,
               std::span<const uint32_t> initial, std::array<uint8_t, 4> expected,
               const RectListShaders* tessellation = nullptr,
               std::span<const uint32_t> push_data = {},
-              std::span<const std::array<uint8_t, 4>> expected_pixels = {}) {
+              std::span<const std::array<uint8_t, 4>> expected_pixels = {},
+              const MeshGpuBatchCase* batch_case = nullptr,
+              const std::vector<uint32_t>* capture = nullptr,
+              uint32_t draw_count = 0u, uint32_t capture_instances = 1u, uint32_t capture_first_instance = 0u) {
     constexpr uint32_t width = 4, height = 4;
     const auto memory = physical.getMemoryProperties();
     const auto allocate = [&](vk::MemoryRequirements requirements, vk::MemoryPropertyFlags flags) {
@@ -89,7 +101,8 @@ public:
     const auto buffer = [&](uint64_t size) {
       BufferAllocation result{};
       vk::BufferCreateInfo info{.size = size, .usage = vk::BufferUsageFlagBits::eStorageBuffer |
-        vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst};
+        vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
+        vk::BufferUsageFlagBits::eIndexBuffer};
       Ok(device.createBuffer(&info, nullptr, &result.buffer));
       result.memory = allocate(device.getBufferMemoryRequirements(result.buffer),
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
@@ -101,6 +114,7 @@ public:
     std::memcpy(output.mapped, initial.data(), initial.size_bytes());
     auto pixels = buffer(width * height * 4u);
     std::memset(pixels.mapped, 0xcd, width * height * 4u);
+    auto headers = buffer(batch_case ? uint64_t{batch_case->groups} * batch_case->instances * 16u : 16u);
     vk::ImageCreateInfo image_info{.imageType = vk::ImageType::e2D,
       .format = vk::Format::eR8G8B8A8Unorm, .extent = {width, height, 1}, .mipLevels = 1,
       .arrayLayers = 1, .samples = vk::SampleCountFlagBits::e1,
@@ -115,13 +129,15 @@ public:
     vk::ImageView view;
     Ok(device.createImageView(&view_info, nullptr, &view));
     const vk::DescriptorSetLayoutBinding binding{MeshEmulationBinding, vk::DescriptorType::eStorageBuffer,
-      1, vk::ShaderStageFlagBits::eCompute | vk::ShaderStageFlagBits::eVertex, nullptr};
+      1, vk::ShaderStageFlagBits::eCompute | vk::ShaderStageFlagBits::eVertex |
+        vk::ShaderStageFlagBits::eFragment, nullptr};
     vk::DescriptorSetLayoutCreateInfo set_info{.bindingCount = 1, .pBindings = &binding};
     vk::DescriptorSetLayout set_layout;
     Ok(device.createDescriptorSetLayout(&set_info, nullptr, &set_layout));
     const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute, 0, 128};
-    vk::PipelineLayoutCreateInfo pipeline_layout_info{.setLayoutCount = 1,
-      .pSetLayouts = &set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &push};
+    const std::array set_layouts{set_layout, set_layout, set_layout};
+    vk::PipelineLayoutCreateInfo pipeline_layout_info{.setLayoutCount = capture ? 3u : 1u,
+      .pSetLayouts = set_layouts.data(), .pushConstantRangeCount = 1, .pPushConstantRanges = &push};
     vk::PipelineLayout pipeline_layout;
     Ok(device.createPipelineLayout(&pipeline_layout_info, nullptr, &pipeline_layout));
     const vk::DescriptorPoolSize pool_size{vk::DescriptorType::eStorageBuffer, 1};
@@ -180,22 +196,42 @@ public:
       .pColorBlendState = &blend, .layout = pipeline_layout};
     vk::Pipeline graphics_pipeline;
     Ok(device.createGraphicsPipelines({}, 1, &graphics_info, nullptr, &graphics_pipeline));
+    vk::Pipeline capture_pipeline{};
+    if (capture) {
+      const vk::PipelineShaderStageCreateInfo stage{.stage = vk::ShaderStageFlagBits::eVertex,
+        .module = module(*capture), .pName = "main"};
+      auto discard = raster;
+      discard.rasterizerDiscardEnable = true;
+      const vk::PipelineRenderingCreateInfo no_attachments{};
+      const vk::PipelineColorBlendStateCreateInfo no_blend{};
+      auto info = graphics_info;
+      info.pNext = &no_attachments;
+      info.stageCount = 1u;
+      info.pStages = &stage;
+      info.pRasterizationState = &discard;
+      info.pColorBlendState = &no_blend;
+      Ok(device.createGraphicsPipelines({}, 1, &info, nullptr, &capture_pipeline));
+    }
     vk::CommandBufferAllocateInfo command_info{.commandPool = pool,
       .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 1};
     vk::CommandBuffer command;
     Ok(device.allocateCommandBuffers(&command_info, &command));
     vk::CommandBufferBeginInfo begin{};
     Ok(command.begin(&begin));
-    if (compute_pipeline) {
-      command.bindPipeline(vk::PipelineBindPoint::eCompute, compute_pipeline);
-      command.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0, 1, &set, 0, nullptr);
-      if (!push_data.empty()) command.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute,
-        0, uint32_t(push_data.size_bytes()), push_data.data());
-      command.dispatch(1, 1, 1);
-      vk::MemoryBarrier barrier{.srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+    if (capture_pipeline) {
+      const vk::RenderingInfo empty{.renderArea = {{0,0},{1,1}}, .layerCount = 1};
+      command.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, VertexStoreSet,
+        1, &set, 0, nullptr);
+      command.beginRendering(&empty);
+      command.bindPipeline(vk::PipelineBindPoint::eGraphics, capture_pipeline);
+      command.bindIndexBuffer(output.buffer, VertexStoreHeaderDwords * sizeof(uint32_t), vk::IndexType::eUint32);
+      command.drawIndexed(draw_count, capture_instances, 0, int32_t(initial[VertexStoreFirst]), capture_first_instance);
+      command.endRendering();
+      const vk::MemoryBarrier barrier{.srcAccessMask = vk::AccessFlagBits::eShaderWrite,
         .dstAccessMask = vk::AccessFlagBits::eShaderRead};
-      command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-        vk::PipelineStageFlagBits::eVertexShader, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eVertexShader,
+        vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eFragmentShader,
+        {}, 1, &barrier, 0, nullptr, 0, nullptr);
     }
     vk::ImageMemoryBarrier to_color{.dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
       .oldLayout = vk::ImageLayout::eUndefined, .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
@@ -208,11 +244,77 @@ public:
       .clearValue = {.color = {.float32 = std::array<float, 4>{0.f, 0.f, 0.f, 1.f}}}};
     vk::RenderingInfo render{.renderArea = scissor, .layerCount = 1, .colorAttachmentCount = 1,
       .pColorAttachments = &color};
-    command.beginRendering(&render);
-    command.bindPipeline(vk::PipelineBindPoint::eGraphics, graphics_pipeline);
-    command.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, 1, &set, 0, nullptr);
-    command.draw(layout.max_primitives * 3u, 1, 0, 0);
-    command.endRendering();
+    const auto groups = batch_case ? batch_case->groups : 1u;
+    const auto instances = batch_case ? batch_case->instances : 1u;
+    const auto batch = batch_case ? PlanMeshEmulationBatch(groups, instances, batch_case->capacity,
+      batch_case->max_groups, batch_case->legacy || !MeshEmulationBatchEnabled() ? 1u : batch_case->max_instances)
+      : MeshEmulationBatch{1u, 1u};
+    uint32_t dispatches = 0, passes = 0, updates = 0, copies = 0;
+    const auto header_dword = MeshEmulationHeaderDword(batch_case ? batch_case->user_clip_planes : 0u);
+    std::array<uint32_t, 4> last_header{};
+    for (uint32_t first_instance = 0; first_instance < instances;) {
+      const auto count_y = std::min(instances - first_instance, batch.instances);
+      for (uint32_t first_group = 0; first_group < groups;) {
+        const auto count_x = std::min(groups - first_group, batch.groups);
+        if (compute_pipeline) {
+          // Match the renderer's scratch-reuse and compute-to-vertex dependencies.
+          ShaderWriteHazardBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
+          last_header = batch_case ? std::array<uint32_t, 4>{first_group, first_instance, groups, instances}
+            : std::array<uint32_t, 4>{initial[0], initial[1], initial[2], initial[3]};
+          if (batch_case && (batch_case->legacy || !MeshEmulationBatchEnabled() ||
+                             header_dword == ShaderRecompiler::IR::PushData::NoStart)) {
+            vk::MemoryBarrier to_header{
+              .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+              .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
+            command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+              vk::PipelineStageFlagBits::eTransfer, {}, 1, &to_header, 0, nullptr, 0, nullptr);
+            if (batch_case->legacy || !MeshEmulationBatchEnabled()) {
+              command.updateBuffer(output.buffer, 0, sizeof(last_header), last_header.data());
+              ++updates;
+            } else {
+              const auto offset = uint64_t{copies} * sizeof(last_header);
+              std::memcpy(static_cast<uint8_t*>(headers.mapped) + offset, last_header.data(), sizeof(last_header));
+              const vk::BufferCopy copy{offset, 0u, sizeof(last_header)};
+              command.copyBuffer(headers.buffer, output.buffer, 1, &copy);
+              ++copies;
+            }
+            ShaderWriteHazardBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
+          }
+          command.bindPipeline(vk::PipelineBindPoint::eCompute, compute_pipeline);
+          command.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0, 1, &set, 0, nullptr);
+          if (!push_data.empty()) command.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute,
+            0, uint32_t(push_data.size_bytes()), push_data.data());
+          if (header_dword != ShaderRecompiler::IR::PushData::NoStart)
+            command.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute,
+              header_dword * 4u, sizeof(last_header), last_header.data());
+          command.dispatch(count_x, count_y, 1);
+          ++dispatches;
+          ShaderWriteBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
+        }
+        command.beginRendering(&render);
+        ++passes;
+        command.bindPipeline(vk::PipelineBindPoint::eGraphics, graphics_pipeline);
+        command.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, 1, &set, 0, nullptr);
+        command.draw(draw_count ? draw_count : count_x * layout.max_primitives * 3u,
+          capture ? capture_instances : count_y, 0, capture ? capture_first_instance : 0u);
+        command.endRendering();
+        color.loadOp = vk::AttachmentLoadOp::eLoad;
+        first_group += count_x;
+      }
+      first_instance += count_y;
+    }
+    if (batch_case) {
+      Check(dispatches == batch_case->expected_batches && passes == batch_case->expected_batches,
+            "mesh batch dispatch or render-pass count differs");
+      Check(updates == (batch_case->legacy || !MeshEmulationBatchEnabled() ? dispatches : 0u),
+            "mesh batch header upload count differs");
+      Check(copies == (!batch_case->legacy && MeshEmulationBatchEnabled() &&
+                       header_dword == ShaderRecompiler::IR::PushData::NoStart ? dispatches : 0u),
+            "mesh batch header stream-copy count differs");
+      std::printf("Mesh GPU batch: %ux%u capacity=%u legacy=%u clips=%02x: %u dispatches, %u render passes, %u updates, %u copies\n",
+        groups, instances, batch_case->capacity, unsigned(batch_case->legacy), batch_case->user_clip_planes,
+        dispatches, passes, updates, copies);
+    }
     vk::ImageMemoryBarrier to_copy = to_color;
     to_copy.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
     to_copy.dstAccessMask = vk::AccessFlagBits::eTransferRead;
@@ -232,7 +334,7 @@ public:
     Ok(queue.submit(1, &submit, {}));
     Ok(queue.waitIdle());
     const auto* record = static_cast<const uint32_t*>(output.mapped);
-    if (compute_pipeline && expected[0] == 255u) {
+    if (compute_pipeline && !batch_case && expected[0] == 255u) {
       Check(record[4] == 3u && record[5] == 1u, "mesh allocation readback differs");
       const std::array<float, 12> positions{-1,-1,0,1, 3,-1,0,1, -1,3,0,1};
       const auto field = std::ranges::find_if(layout.fields, [](const auto& f) {
@@ -267,11 +369,20 @@ public:
         Check(false, "portable GPU pixel mismatch");
       }
     }
-    for (uint32_t i = MeshEmulationLayout::HeaderDwords + layout.GroupDwords(); i < initial.size(); ++i)
-      Check(record[i] == initial[i], "mesh compute wrote beyond its output record");
+    if (batch_case)
+      Check(std::equal(last_header.begin(), last_header.end(), record),
+            "mesh batch header or final chunk base differs");
+    const auto record_count = batch_case ? batch.groups * batch.instances
+      : capture ? 0u : std::max(1u, draw_count / (layout.max_primitives * 3u));
+    const auto guard = capture ? initial.size() - 16u
+      : MeshEmulationLayout::HeaderDwords + record_count * layout.GroupDwords();
+    for (uint32_t i = static_cast<uint32_t>(guard); i < initial.size(); ++i)
+      Check(record[i] == initial[i], "mesh compute wrote beyond its output records");
+    const std::vector<uint8_t> image_pixels(read_pixels, read_pixels + width * height * 4u);
     device.freeCommandBuffers(pool, 1, &command);
     device.destroyPipeline(graphics_pipeline);
     device.destroyPipeline(compute_pipeline);
+    device.destroyPipeline(capture_pipeline);
     for (auto shader : modules) device.destroyShaderModule(shader);
     device.destroyDescriptorPool(descriptor_pool);
     device.destroyPipelineLayout(pipeline_layout);
@@ -279,14 +390,16 @@ public:
     device.destroyImageView(view);
     device.destroyImage(image);
     device.freeMemory(image_memory);
-    for (auto allocation : {output, pixels}) {
+    for (auto allocation : {output, pixels, headers}) {
       device.unmapMemory(allocation.memory);
       device.destroyBuffer(allocation.buffer);
       device.freeMemory(allocation.memory);
     }
+    return image_pixels;
   }
 
   uint32_t subgroup_size = 0;
+  bool clip_distance = false;
 private:
   static void Ok(vk::Result result) {
     if (result != vk::Result::eSuccess) std::fprintf(stderr, "Vulkan: %s\n", vk::to_string(result).c_str());
@@ -301,7 +414,29 @@ private:
   uint32_t family = 0;
 };
 
+void TestMeshEmulationBatchPlan() {
+  const auto check = [](uint32_t groups, uint32_t instances, uint64_t capacity,
+                        uint32_t max_x, uint32_t max_y, uint32_t x, uint32_t y) {
+    const auto batch = PlanMeshEmulationBatch(groups, instances, capacity, max_x, max_y);
+    Check(batch.groups == x && batch.instances == y, "mesh scratch batch plan differs");
+  };
+  check(4, 4, 16, 65535, 65535, 4, 4);
+  check(4, 4, 10, 65535, 65535, 4, 2);
+  check(4, 4, 3, 65535, 65535, 3, 1);
+  check(4, 4, 16, 2, 65535, 2, 1);
+  check(4, 4, 16, 65535, 2, 4, 2);
+  check(UINT32_MAX, UINT32_MAX, UINT64_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX);
+  using ShaderRecompiler::IR::PushData;
+  Check(MeshEmulationHeaderDword(0) == (MeshEmulationBatchEnabled() ? 5u : PushData::NoStart),
+        "mesh header overlaps its draw prefix");
+  Check(MeshEmulationHeaderDword(0x10u) == (MeshEmulationBatchEnabled() ? 25u : PushData::NoStart),
+        "mesh header overlaps user clip planes");
+  Check(MeshEmulationHeaderDword(0x20u) == PushData::NoStart,
+        "full clip-plane layout must retain the storage header");
+}
+
 void TestMeshEmulationGpu() {
+  TestMeshEmulationBatchPlan();
   MeshGpuTest gpu;
   const uint32_t pixel_code[]{
     EncodeVop1(0x01, 0, 242), EncodeVop1(0x01, 1, 128),
@@ -354,6 +489,94 @@ void TestMeshEmulationGpu() {
     }
   }
   std::printf("Mesh GPU: %u cases passed, exact pixels and output records\n", cases);
+
+  // Guest group and instance IDs place one triangle at each pixel of a 4x4 grid.
+  // Missing records, wrong chunk bases or a wrong instance stride leave black pixels.
+  const auto test_grid = [&](uint32_t wave, uint32_t clip_planes) {
+    const uint32_t code[]{
+      EncodeSMovB32(124, 255), 0x1003u, EncodeSopp(0x10, 9),
+      EncodeVop1(0x06, 10, 261), EncodeVop1(0x06, 11, 262), // group and instance to float
+      EncodeVop2(0x08, 10, 255, 10), 0x3f000000u,
+      EncodeVop2(0x08, 11, 255, 11), 0x3f000000u,
+      EncodeVop2(0x03, 10, 255, 10), 0xbf4ccccdu,
+      EncodeVop2(0x03, 11, 255, 11), 0xbf4ccccdu,
+      0xd7650001u, 0x000100c1u,
+      EncodeVop1(0x01, 2, 255), 0xbf800000u,
+      EncodeVop1(0x01, 3, 255), 0xbf800000u,
+      EncodeVop1(0x01, 4, 255), 0x40400000u,
+      EncodeVopc(0xc2, 129, 1), EncodeVop2(0x01, 2, 258, 4),
+      EncodeVopc(0xc2, 130, 1), EncodeVop2(0x01, 3, 259, 4),
+      EncodeVop2(0x08, 2, 255, 2), 0x3e4ccccdu,
+      EncodeVop2(0x08, 3, 255, 3), 0x3e4ccccdu,
+      EncodeVop2(0x03, 2, 266, 2), EncodeVop2(0x03, 3, 267, 3),
+      EncodeVop1(0x01, 5, 128), EncodeVop1(0x01, 6, 242),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(2, 3, 5, 6),
+      EncodeVop1(0x01, 9, 255), 0x00200400u,
+      EncodeExp0(0x14, 0x1), EncodeExp1(9, 0, 0, 0), EncodeSopp(0x01)};
+    ShaderVertexInputInfo input{};
+    input.logical_stage = ShaderType::Mesh;
+    input.user_clip_planes = clip_planes;
+    auto& mesh = input.mesh;
+    mesh.emulated = true;
+    mesh.fast_launch = true;
+    mesh.input_primitive = static_cast<uint32_t>(Prospero::PrimitiveType::kPointList);
+    mesh.wave_size = wave;
+    mesh.host_subgroup_size = gpu.subgroup_size;
+    mesh.threads_num[0] = wave;
+    mesh.threads_num[1] = mesh.threads_num[2] = 1;
+    mesh.max_vertices = mesh.vertices_per_group = 3;
+    mesh.max_primitives = mesh.primitives_per_group = 1;
+    ShaderRecompiler::CompileOptions options{};
+    options.stage = ShaderType::Mesh;
+    options.wave_size = wave;
+    options.input_info.vertex = &input;
+    const auto header_dword = MeshEmulationHeaderDword(clip_planes);
+    const auto prefix_dwords = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(true, false, clip_planes);
+    const auto result = RecompileForTest(code, options,
+      prefix_dwords + (header_dword != ShaderRecompiler::IR::PushData::NoStart
+        ? MeshEmulationLayout::HeaderDwords : 0u));
+    const auto layout = BuildMeshEmulationLayout(result.program.info.outputs, input);
+    const auto vertex = BuildMeshEmulationVertexShader(layout, 0);
+    const MeshGpuBatchCase cases[]{
+      {4, 4, 16, 65535, 65535, 1}, // all records fit
+      {4, 4, 10, 65535, 65535, 2}, // instance boundary, with unused tail records
+      {4, 4, 3, 65535, 65535, 8},  // group boundary, including a short final chunk
+      {4, 4, 16, 2, 65535, 8},     // dispatch X limit
+      {4, 4, 16, 65535, 2, 2}};   // dispatch Y limit
+    std::vector<uint32_t> prefix(prefix_dwords, 0u);
+    prefix[0] = 4u;
+    for (auto test : cases) {
+      test.user_clip_planes = clip_planes;
+      std::vector<uint32_t> initial(4u + test.capacity * layout.GroupDwords() + 16u, 0xcdcdcdcdu);
+      initial[0] = initial[1] = 0;
+      initial[2] = initial[3] = 4;
+      auto legacy = test;
+      legacy.legacy = true;
+      legacy.expected_batches = test.capacity < 4u || test.max_groups < 4u ? 8u : 4u;
+      const auto reference = gpu.Render(result.spirv, layout, vertex, fragment, initial,
+        {255, 0, 0, 255}, nullptr, prefix, {}, &legacy);
+      if (!MeshEmulationBatchEnabled()) test.expected_batches = legacy.expected_batches;
+      const auto batched = gpu.Render(result.spirv, layout, vertex, fragment, initial,
+        {255, 0, 0, 255}, nullptr, prefix, {}, &test);
+      Check(batched == reference, "batched mesh pixels differ from the old loop");
+      if (clip_planes == 0u && test.capacity == 16u && test.max_groups == 65535u &&
+          test.max_instances == 65535u) {
+        const auto tessellation = BuildTriangleShaders({}, 0u, 0u);
+        const auto old_tess = gpu.Render(result.spirv, layout, vertex, fragment, initial,
+          {255, 0, 0, 255}, &tessellation, prefix, {}, &legacy);
+        const auto batched_tess = gpu.Render(result.spirv, layout, vertex, fragment, initial,
+          {255, 0, 0, 255}, &tessellation, prefix, {}, &test);
+        Check(batched_tess == old_tess && batched_tess == reference,
+              "batched instances differ through generated triangle stages");
+        std::puts("Mesh GPU: batched instances also match through generated triangle stages");
+      }
+    }
+  };
+  for (const auto clip_planes : {0u, 0x10u, 0x20u}) {
+    if (clip_planes != 0u && !gpu.clip_distance) continue;
+    for (const auto wave : {32u, 64u}) test_grid(wave, clip_planes);
+  }
+  std::puts("Mesh GPU: batched groups, instances and chunk boundaries match the old loop exactly");
 
   // Packed corner values include a NaN payload. Any float interpolation corrupts their bits.
   const std::array<uint32_t, 3> words{0x7fc01234u, 0xff801234u, 0x12345678u};

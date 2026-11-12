@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/dlss.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -89,6 +90,19 @@ struct SubmitInfo {
 	}
 };
 
+// The rendering scope has no scheduler state. Tests can record its native commands directly.
+class RenderingScope {
+public:
+	void Begin(vk::CommandBuffer command, const RenderState& state, bool merge_passes,
+	           bool attachment_ops);
+	void End(vk::CommandBuffer command);
+	[[nodiscard]] bool Active() const noexcept { return m_active; }
+
+private:
+	RenderState m_state;
+	bool        m_active = false;
+};
+
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
@@ -118,14 +132,13 @@ private:
 	void Begin();
 	void End() const;
 
-	RenderContext&      m_context;
-	GraphicContext&     m_graphics;
-	vk::CommandBuffer   m_buffer = nullptr;
-	mutable RenderState m_render_state;
-	mutable bool        m_rendering   = false;
-	HW::Context*        m_registers   = nullptr;
-	HW::UserConfig*     m_user_config = nullptr;
-	HW::Shader*         m_shaders     = nullptr;
+	RenderContext&         m_context;
+	GraphicContext&        m_graphics;
+	vk::CommandBuffer      m_buffer = nullptr;
+	mutable RenderingScope m_rendering;
+	HW::Context*           m_registers   = nullptr;
+	HW::UserConfig*        m_user_config = nullptr;
+	HW::Shader*            m_shaders     = nullptr;
 
 	friend class CommandScheduler;
 };
@@ -174,12 +187,12 @@ private:
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                   const DrawEmitInfo& emit, DrawRenderState& state);
+	                                    const DrawEmitInfo& emit, const DrawRenderState& state);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                          DrawRenderState& state);
-	void                      ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                              DrawRenderState& state, const DrawEmitInfo& emit,
-	                                              const DrawIndexBufferSource& index_source);
+	void               ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                       DrawRenderState& state, const DrawEmitInfo& emit,
+	                                       const DrawIndexBufferSource& index_source);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -194,6 +207,15 @@ private:
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool        Upscale(vk::CommandBuffer command, const Pssr::Request& request,
+	                                  Dlss::Inputs& inputs);
+
+	// DLSS history of a PSSR context; a null feature is one DLSS refused or failed.
+	struct DlssContext {
+		uint64_t       context;
+		Dlss::Creation creation;
+		Dlss::Feature* feature;
+	};
 
 	// GET_LOD_STATS counters since their last reset. With --lod-stats a bound T# with counting
 	// enabled counts as sampled at its BASE_LEVEL, clamped when its MIN_LOD lies above that level.
@@ -206,6 +228,8 @@ private:
 	RenderContext&                        m_context;
 	bool                                  m_lod_stats = Config::LodStatsEnabled();
 	GraphicsBindings                     m_graphics_bindings;
+	// The current draw's targets; PrepareDrawRenderState resolves them again for each draw.
+	DrawTargets                           m_targets;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
@@ -213,6 +237,7 @@ private:
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
+	std::vector<DlssContext>              m_dlss_contexts;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
 
 	friend class CommandProcessor;

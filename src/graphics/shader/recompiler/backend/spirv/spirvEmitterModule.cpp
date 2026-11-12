@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/meshEmulation.h"
+#include "graphics/host_gpu/renderer/perVertexVsStore.h"
 #include "graphics/shader/triangleShader.h"
 
 #include <algorithm>
@@ -244,13 +245,15 @@ void DefineDescriptors(EmitterState& state) {
 	for (auto& buffer: info.buffers) {
 		buffer.descriptor_index = buffer.live ? buffer_count++ : UINT32_MAX;
 	}
-	if (state.MeshEmulated()) {
+	if (state.MeshEmulated() || state.pv_store.vertex_store ||
+	    (state.program.stage == ShaderType::Pixel && state.pv_store.per_vertex_buffer)) {
 		state.mesh_output_buffer = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassStorageBuffer,
 		                StorageBufferType(state, state.storage_buffers[2])),
 		    spv::StorageClassStorageBuffer);
 		state.builder.AddAnnotation(spv::OpDecorate, state.mesh_output_buffer,
-		                            spv::DecorationDescriptorSet, 0u);
+		                            spv::DecorationDescriptorSet,
+		                            state.pv_store.vertex_store ? VertexStoreSet : 0u);
 		state.builder.AddAnnotation(spv::OpDecorate, state.mesh_output_buffer,
 		                            spv::DecorationBinding, MeshEmulationBinding);
 		state.builder.AddName(state.mesh_output_buffer, "mesh_output");
@@ -508,6 +511,10 @@ void DefineInputs(EmitterState& state) {
 		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
 	}
+	if (state.pv_store.vertex_store && state.program.stage == ShaderType::Vertex) {
+		add_builtin(IR::StageInputKind::VertexIndex, 1, "gl_VertexIndex");
+		add_builtin(IR::StageInputKind::InstanceIndex, 1, "gl_InstanceIndex");
+	}
 	if (state.program.stage == ShaderType::Mesh) {
 		// The output wrapper uses the invocation index even if the guest body does not.
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
@@ -566,6 +573,9 @@ void DefineInputs(EmitterState& state) {
 					if (components > 1u) {
 						type = state.builder.Type(spv::OpTypeVector, type, components);
 					}
+				} else if (input.per_vertex && state.pv_store.per_vertex_buffer) {
+					// One DWORD address per original corner. Loads retain packed and NaN bits.
+					type = TypeU32Vector(state, 3);
 				} else if (input.per_vertex) {
 					type = state.builder.Type(spv::OpTypeArray, TypeF32Vector(state, 4),
 					                          ConstantU32(state, 3));
@@ -819,7 +829,10 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.buffer_u16) {
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
 	}
-	if (state.program.info.uses_dma || state.program.info.uses_image_heap) {
+	const bool physical_addresses = state.program.info.uses_dma ||
+	                                state.program.info.uses_image_heap ||
+	                                state.program.info.uses_device_address;
+	if (physical_addresses) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -895,9 +908,8 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel(state.program.info.uses_dma || state.program.info.uses_image_heap
-	                                 ? spv::AddressingModelPhysicalStorageBuffer64
-	                                 : spv::AddressingModelLogical,
+	state.builder.AddMemoryModel(physical_addresses ? spv::AddressingModelPhysicalStorageBuffer64
+	                                                : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);
 	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
 	// contract prevents host compilers from treating synthesized IEEE values as finite.

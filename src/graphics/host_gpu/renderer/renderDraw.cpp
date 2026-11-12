@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/gpuWorkLog.h"
+#include "graphics/host_gpu/renderer/perVertexVsStore.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -108,9 +109,8 @@ static const char* RenderColorTypeName(const RenderColorInfo& color) {
 	return color.image_id ? "RenderTexture" : "NoColorOutput";
 }
 
-static void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& color,
-                               const RenderDepthInfo& depth, const CommandBuffer& buffer,
-                               uint32_t index_count, uint32_t flags) {
+static void LogFramebufferSkip(const char* draw_name, const RenderDepthInfo& depth,
+                               const CommandBuffer& buffer, uint32_t index_count, uint32_t flags) {
 	const auto& ctx  = buffer.GetRegisters();
 	const auto& ucfg = buffer.GetUserConfig();
 	if (!graphics_debug_dump_enabled()) {
@@ -122,16 +122,13 @@ static void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& col
 		return;
 	}
 
-	LOGF(
-	    "DrawFramebufferSkip[%u]: %s color=%s color_addr=0x%010" PRIx64 " color_size=0x%016" PRIx64
-	    " color_image=%s depth_format=%s depth_image=%s depth_vaddr_num=%d target_mask=0x%08" PRIx32
-	    " prim=%u index_count=%u flags=0x%08" PRIx32 "\n",
-	    log_id, draw_name, RenderColorTypeName(color), color.desc.info.data.address,
-	    color.desc.info.data.size, color.image_id ? "yes" : "no",
-	    vk::to_string(depth.desc.view_info.format).c_str(), depth.image_id ? "yes" : "no",
-	    static_cast<int>(!depth.desc.info.data.Empty()) +
-	        static_cast<int>(depth.desc.info.HasStencil()),
-	    ctx.GetRenderTargetMask(), static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags);
+	LOGF("DrawFramebufferSkip[%u]: %s depth_format=%s depth_image=%s depth_vaddr_num=%d "
+	     "target_mask=0x%08" PRIx32 " prim=%u index_count=%u flags=0x%08" PRIx32 "\n",
+	     log_id, draw_name, vk::to_string(depth.desc.view_info.format).c_str(),
+	     depth.image_id ? "yes" : "no",
+	     static_cast<int>(!depth.desc.info.data.Empty()) +
+	         static_cast<int>(depth.desc.info.HasStencil()),
+	     ctx.GetRenderTargetMask(), static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags);
 }
 
 static void LogMrtState(const char* draw_name, const CommandBuffer& buffer,
@@ -612,7 +609,7 @@ struct DrawIndexBufferSource {
 // The task shader's inputs for an indirect mesh draw: Params in gpu_mesh_indirect.task.
 struct MeshTaskParams {
 	vk::DeviceAddress records        = 0;
-	uint64_t          index_address  = 0;
+	vk::DeviceAddress index_address  = 0;
 	uint32_t          stride         = 0;
 	uint32_t          index_size     = 0;
 	uint32_t          index_limit    = 0;
@@ -859,20 +856,22 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                         &ShaderVertexInputInfo::stage)) {
 		return false;
 	}
+	auto& targets       = m_targets;
+	targets.color_count = 0;
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((state.mrt_mask & (1u << slot)) != 0) {
-			ResolveRenderColorTarget(buffer, state.color_info[state.color_count], slot);
-			if (state.color_info[state.color_count].image_id) {
-				state.color_count++;
+			ResolveRenderColorTarget(buffer, targets.colors[targets.color_count], slot);
+			if (targets.colors[targets.color_count].image_id) {
+				targets.color_count++;
 			}
 		}
 	}
-	ResolveRenderDepthTarget(buffer, state.depth_info);
+	ResolveRenderDepthTarget(buffer, targets.depth);
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
-	const auto colors       = std::span {state.color_info, state.color_count};
-	const auto pass_samples = state.depth_info.image_id ? state.depth_info.desc.info.samples
-	                                                    : state.color_info[0].desc.info.samples;
+	const auto colors       = std::span {targets.colors, targets.color_count};
+	const auto pass_samples = targets.depth.image_id ? targets.depth.desc.info.samples
+	                                                 : targets.colors[0].desc.info.samples;
 	if (std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
 		    return color.desc.info.samples != pass_samples;
 	    })) {
@@ -881,9 +880,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		const auto dropped = std::ranges::remove_if(colors, [&](const RenderColorInfo& color) {
 			return color.desc.info.samples != raster;
 		});
-		state.color_count -= static_cast<uint32_t>(dropped.size());
-		if (state.depth_info.image_id && state.depth_info.desc.info.samples != raster) {
-			state.depth_info = {};
+		targets.color_count -= static_cast<uint32_t>(dropped.size());
+		if (targets.depth.image_id && targets.depth.desc.info.samples != raster) {
+			targets.depth = {};
 		}
 		static std::atomic_bool logged = false;
 		if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -892,9 +891,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 
-	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
-		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
-		                   draw.index_count, 0);
+	if (targets.color_count == 0 && !targets.depth.image_id && !state.ps_active) {
+		LogFramebufferSkip(draw.Name(), targets.depth, buffer, draw.index_count, 0);
 		return false;
 	}
 
@@ -939,8 +937,8 @@ static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBu
 }
 
 static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
-	                             const DrawRenderState& state, uint32_t index_type_and_size,
-                                 const void* index_addr) {
+                                 const DrawRenderState& state, const DrawTargets& targets,
+                                 uint32_t index_type_and_size, const void* index_addr) {
 	if (!graphics_debug_dump_enabled()) {
 		return;
 	}
@@ -949,12 +947,15 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 		return;
 	}
 
+	static const RenderColorInfo none {};
+
+	const auto& color = targets.color_count != 0 ? targets.colors[0] : none;
 	if (state.ps_active) {
-		LogDrawTargetState(draw.Name(), state.color_info[0], state.depth_info, buffer,
-		                   state.ps_input_info, draw.index_count, 0);
+		LogDrawTargetState(draw.Name(), color, targets.depth, buffer, state.ps_input_info,
+		                   draw.index_count, 0);
 	}
-	LogDrawInputState(buffer, state.color_info[0], state.vertex_info[0], index_type_and_size,
-	                  draw.index_count, index_addr);
+	LogDrawInputState(buffer, color, state.vertex_info[0], index_type_and_size, draw.index_count,
+	                  index_addr);
 }
 
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
@@ -996,19 +997,19 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 }
 
 bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
-                                       const DrawEmitInfo& emit, DrawRenderState& state) {
+                                      const DrawEmitInfo& emit, const DrawRenderState& state) {
 	if (!buffer.GetRegisters().GetRenderControl().copy_depth_to_color) {
 		return false;
 	}
 	auto& ucfg = buffer.GetUserConfig();
 	const auto& hw = buffer.GetRegisters();
-	auto& depth = state.depth_info;
-	auto& color = state.color_info[0];
+	auto&       depth = m_targets.depth;
+	auto&       color = m_targets.colors[0];
 	EXIT_NOT_IMPLEMENTED(
 	    !m_context.GetGraphics().maintenance8_enabled ||
 	    !Prospero::IsRectList(ucfg.GetPrimType()) || draw.indexed || draw.index_count != 3 ||
 	    draw.instance_count != 1 || emit.vertex_offset != 0 || emit.first_instance != 0 ||
-	    state.color_count != 1 || color.target_slot != 0 || !depth.image_id ||
+	    m_targets.color_count != 1 || color.target_slot != 0 || !depth.image_id ||
 	    color.desc.info.samples != 1 || depth.desc.info.extent.width != color.Extent().width ||
 	    depth.desc.info.extent.height != color.Extent().height ||
 	    depth.desc.view_info.layer_count != 1 || color.desc.view_info.layer_count != 1 ||
@@ -1066,9 +1067,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	const bool  mesh_active   = state.vertex_info[0].stage.module->info.stage == ShaderType::Mesh;
 	const bool  mesh_task     = state.vertex_info[0].stage.module->mesh_task;
 	const bool  emulated_mesh = state.vertex_info[0].stage.module->MeshEmulated();
-	const bool tessellation = vertex_stages.size() == 3 ||
+	bool tessellation = vertex_stages.size() == 3 ||
 	    (!mesh_active && state.topology == vk::PrimitiveTopology::ePatchList) ||
-	    (state.ps_active && !state.ps_input_info.stage.module->triangle_parameters.empty());
+	    (state.ps_active && !state.ps_input_info.stage.module->triangle_parameters.empty() &&
+	     !state.per_vertex_buffer);
 	const auto& mesh          = state.vertex_info[0].mesh;
 	const auto& limits        = m_context.GetGraphics().mesh_shader_properties;
 	uint32_t    mesh_groups   = 0;
@@ -1103,12 +1105,15 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		}
 	}
 
+	// Mesh shaders read the original guest indices in whole DWORDs by device address. Their buffer
+	// exists before the descriptors bind, so creating it merges no buffer this draw binds.
+	uint64_t index_begin = 0;
+	uint64_t index_end   = 0;
 	if (mesh_active && draw.indexed) {
-		// Register the original guest indices for shader reads; PrepareGraphicsBindings
-		// synchronizes registered BDA ranges before any draw commands are committed.
-		(void)m_context.GetBufferCache().FindBuffer(
-		    index_source.address, static_cast<uint64_t>(draw.index_count) *
-		                              index_source.guest_element_size);
+		const auto size = static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size;
+		index_begin     = index_source.address & ~uint64_t {3};
+		index_end       = (index_source.address + size + 3u) & ~uint64_t {3};
+		(void)m_context.GetBufferCache().FindBuffer(index_begin, index_end - index_begin);
 	}
 	DrawCallInfo host_draw = draw;
 	DrawIndexBufferSource host_index_source = index_source;
@@ -1141,6 +1146,63 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		                     .size = uint64_t{triangle_indices.size()} * sizeof(uint32_t),
 		                     .guest_element_size = 4u};
 	}
+	VertexStorePlan vertex_store_plan;
+	std::vector<uint32_t> vertex_store_header;
+	if (state.vertex_store) {
+		std::vector<uint32_t> indices(host_draw.index_count);
+		const bool supported = emit.indirect.address == 0 &&
+		    (!state.primitive_restart_enable || expand_triangles);
+		if (supported) {
+			if (host_draw.indexed) {
+				const auto element_size = host_index_source.host_data != nullptr
+				    ? (host_index_source.guest_element_size == 4u ? 4u : 2u)
+				    : host_index_source.guest_element_size;
+				const auto bytes = uint64_t{host_draw.index_count} * element_size;
+				if (host_index_source.host_data == nullptr)
+					m_context.GetBufferCache().ReadMemory(host_index_source.address, bytes);
+				const auto* source = host_index_source.host_data != nullptr
+				    ? static_cast<const uint8_t*>(host_index_source.host_data)
+				    : reinterpret_cast<const uint8_t*>(host_index_source.address);
+				for (uint32_t i = 0; i < host_draw.index_count; ++i)
+					std::memcpy(&indices[i], source + uint64_t{i} * element_size, element_size);
+			} else {
+				for (uint32_t i = 0; i < host_draw.index_count; ++i) indices[i] = i;
+			}
+			auto& storage = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::DeviceLocal);
+			const auto limit = std::min<uint64_t>(storage.Size(),
+			    m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+			vertex_store_plan = PlanVertexStore(indices, emit.vertex_offset, host_draw.instance_count,
+			    state.vertex_info[0].stage.module->mesh_layout.vertex_dwords, limit);
+		}
+		if (!vertex_store_plan.valid) {
+			// Invalid indices and empty draws are not a storage-capacity failure.
+			const bool valid_capture_input = supported && !indices.empty() && indices.size() % 3u == 0 &&
+			    host_draw.instance_count != 0 &&
+			    state.vertex_info[0].stage.module->mesh_layout.vertex_dwords != 0 &&
+			    std::ranges::all_of(indices, [&](uint32_t index) {
+				    const auto vertex = int64_t {index} + emit.vertex_offset;
+				    return vertex >= 0 && vertex <= INT32_MAX;
+			    });
+			state.corner_tessellation_reason = emit.indirect.address != 0
+			    ? CornerTessellationReason::Indirect
+			    : !supported ? CornerTessellationReason::PrimitiveRestart
+			    : valid_capture_input ? CornerTessellationReason::CaptureRange
+			                          : CornerTessellationReason::Other;
+			state.force_corner_tessellation = true;
+			m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
+			tessellation = true;
+		} else {
+			vertex_store_header.resize(vertex_store_plan.records_offset);
+			vertex_store_header[VertexStoreFirst] = vertex_store_plan.first;
+			vertex_store_header[VertexStoreSpan] = vertex_store_plan.span;
+			vertex_store_header[VertexStoreFirstInstance] = emit.first_instance;
+			vertex_store_header[VertexStoreIndexCount] = host_draw.index_count;
+			vertex_store_header[VertexStoreStride] = state.vertex_info[0].stage.module->mesh_layout.vertex_dwords;
+			vertex_store_header[VertexStoreRecords] = vertex_store_plan.records_offset;
+			std::ranges::copy(vertex_store_plan.indices,
+			                  vertex_store_header.begin() + VertexStoreHeaderDwords);
+		}
+	}
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1153,12 +1215,17 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		descriptor_stages[stage_count++] = &bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	PrepareGraphicsBindings(stages, std::span {m_targets.colors, m_targets.color_count});
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
+	vk::DeviceAddress     mesh_indices = 0;
 	if (!mesh_active) {
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, host_index_source);
+	} else if (draw.indexed) {
+		const auto [indices, offset] =
+		    m_context.GetBufferCache().ObtainBuffer(index_begin, index_end - index_begin, false);
+		mesh_indices = indices->BufferDeviceAddress() + offset + (index_source.address & 3u);
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
 	if (emit.indirect.address != 0) {
@@ -1168,12 +1235,18 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
+	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets);
 	vk::ImageAspectFlags feedback_aspects;
-	const auto rendering =
-	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
-	                         feedback_aspects, stages);
+	const auto rendering = AcquireRenderTargets(buffer, m_targets.colors, m_targets.color_count,
+	                                            m_targets.depth, feedback_aspects, stages);
 	uint32_t emulated_group_limit = 0u;
+	uint32_t emulated_instance_limit = 1u;
+	bool emulated_batching = emulated_mesh && MeshEmulationBatchEnabled();
+	const auto emulated_header = emulated_mesh
+	    ? MeshEmulationHeaderDword(vertex_stages.back().user_clip_planes)
+	    : ShaderRecompiler::IR::PushData::NoStart;
+	vk::Buffer emulated_header_buffer;
+	uint64_t emulated_header_offset = 0u;
 	if (emulated_mesh) {
 		const auto& layout = state.vertex_info[0].stage.module->mesh_layout;
 		auto& storage = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::DeviceLocal);
@@ -1186,14 +1259,45 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		    (limit - header_bytes) / group_bytes, compute_limits.maxComputeWorkGroupCount[0]));
 		emulated_group_limit = std::min(emulated_group_limit, UINT32_MAX / (layout.max_primitives * 3u));
 		EXIT_IF(emulated_group_limit == 0u);
+		if (emulated_batching) {
+			const auto batch = PlanMeshEmulationBatch(mesh_groups, draw.instance_count,
+			    (limit - header_bytes) / group_bytes, emulated_group_limit,
+			    compute_limits.maxComputeWorkGroupCount[1]);
+			emulated_group_limit = batch.groups;
+			emulated_instance_limit = batch.instances;
+			if (emulated_header == ShaderRecompiler::IR::PushData::NoStart) {
+				// Full clip-plane layouts leave no push space. Upload all headers before recording.
+				auto& stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+				const auto chunks = uint64_t{(mesh_groups - 1u) / batch.groups + 1u} *
+				    ((draw.instance_count - 1u) / batch.instances + 1u);
+				if (chunks <= stream.Size() / header_bytes) {
+					std::vector<std::array<uint32_t, MeshEmulationLayout::HeaderDwords>> headers;
+					headers.reserve(static_cast<size_t>(chunks));
+					for (uint32_t instance = 0; instance < draw.instance_count;) {
+						for (uint32_t first = 0; first < mesh_groups;) {
+							headers.push_back({first, instance, mesh_groups, draw.instance_count});
+							first += std::min(mesh_groups - first, batch.groups);
+						}
+						instance += std::min(draw.instance_count - instance, batch.instances);
+					}
+					emulated_header_buffer = stream.Handle();
+					emulated_header_offset = stream.Copy(headers.data(), chunks * header_bytes, 4u);
+				} else {
+					// A draw larger than the upload ring keeps the bounded legacy loop.
+					emulated_batching = false;
+					emulated_instance_limit = 1u;
+				}
+			}
+		}
 		bindings.vertex[0].mesh_output = {storage.Handle(), 0u,
-		    header_bytes + group_bytes * std::min(mesh_groups, emulated_group_limit)};
+		    header_bytes + group_bytes * std::min(mesh_groups, emulated_group_limit) *
+		        emulated_instance_limit};
 	}
 	vk::DeviceAddress task_params = 0;
 	if (mesh_task) {
 		const MeshTaskParams params {
 		    .records        = args_buffer.first->BufferDeviceAddress() + args_buffer.second,
-		    .index_address  = index_source.address,
+		    .index_address  = mesh_indices,
 		    .stride         = emit.indirect.stride,
 		    .index_size     = index_source.guest_element_size,
 		    .index_limit    = draw.index_count,
@@ -1223,11 +1327,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		work.width        = rendering.width;
 		work.height       = rendering.height;
 		work.color_count  = rendering.num_color_attachments;
-		work.tessellation = state.ps_active &&
-		                    !state.ps_input_info.stage.module->triangle_parameters.empty();
+		work.tessellation = tessellation;
 		if (emulated_mesh) {
 			const auto chunks = (mesh_groups - 1u) / emulated_group_limit + 1u;
-			work.host_passes  = uint64_t {draw.instance_count} * chunks;
+			work.host_passes  = uint64_t {(draw.instance_count - 1u) / emulated_instance_limit + 1u} * chunks;
 			work.elements     = uint64_t {std::min(mesh_groups, emulated_group_limit)} *
 			                    mesh.max_primitives * 3u;
 		}
@@ -1261,8 +1364,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			draw_data = {draw.index_count,
 			             static_cast<uint32_t>(emit.vertex_offset),
 			             index_source.guest_element_size,
-			             static_cast<uint32_t>(index_source.address),
-			             static_cast<uint32_t>(index_source.address >> 32u)};
+			             static_cast<uint32_t>(mesh_indices),
+			             static_cast<uint32_t>(mesh_indices >> 32u)};
 		} else {
 			draw_data[0] = buffer.GetUserConfig().GetObjectId();
 		}
@@ -1277,7 +1380,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
-	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
+	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), m_targets.depth,
 	                           rendering);
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
@@ -1297,45 +1400,149 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		buffer.EndRendering();
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
+	const auto record_tessellation_reason = [&] {
+		using Common::DebugCounters::Add;
+		using Common::DebugCounters::Counter;
+		if (vertex_stages.size() == 3) {
+			Add(Counter::TessellationPatches);
+		} else if (!mesh_active && Prospero::IsRectList(ucfg.GetPrimType())) {
+			Add(Counter::TessellationRectangles);
+		} else {
+			Add(Counter::TessellationCorners);
+			Counter reason = Counter::CornerFallbackOther;
+			switch (state.corner_tessellation_reason) {
+				case CornerTessellationReason::Indirect: reason = Counter::CornerFallbackIndirect; break;
+				case CornerTessellationReason::PrimitiveRestart: reason = Counter::CornerFallbackRestart; break;
+				case CornerTessellationReason::CaptureRange: reason = Counter::CornerFallbackCaptureRange; break;
+				case CornerTessellationReason::OutputKind: reason = Counter::CornerFallbackOutputKind; break;
+				case CornerTessellationReason::SideEffects: reason = Counter::CornerFallbackSideEffects; break;
+				case CornerTessellationReason::SwitchOff: reason = Counter::CornerFallbackSwitchOff; break;
+				case CornerTessellationReason::Other: break;
+			}
+			Add(reason);
+		}
+	};
 	if (emulated_mesh) {
 		EXIT_IF(pipeline.mesh_compute_pipeline == nullptr || mesh_task);
 		auto& storage = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::DeviceLocal);
 		auto& queries = m_context.GetOcclusionQueries();
-		for (uint32_t instance = 0; instance < draw.instance_count; ++instance) {
-			for (uint32_t first_group = 0; first_group < mesh_groups;) {
-				const auto count = std::min(mesh_groups - first_group, emulated_group_limit);
-				buffer.EndRendering();
-				// The scratch region is reused only after all preceding shader accesses finish.
-				const vk::MemoryBarrier to_header{
-				    .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-				    .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
-				vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-				    vk::PipelineStageFlagBits::eTransfer, {}, 1u, &to_header, 0u, nullptr, 0u, nullptr);
-				const std::array<uint32_t, MeshEmulationLayout::HeaderDwords> header{
-				    first_group, instance, mesh_groups, draw.instance_count};
-				vk_buffer.updateBuffer(storage.Handle(), 0u, sizeof(header), header.data());
-				ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-				vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.mesh_compute_pipeline);
-				vk_buffer.dispatch(count, 1u, 1u);
-				ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-				buffer.BeginRendering(rendering);
-				vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
-				const auto query = queries.Begin(vk_buffer);
-				vk_buffer.draw(count * mesh.max_primitives * 3u, 1u, 0u, 0u);
-				if (tessellation) {
-					m_context.RecordTessellationDraw(count * mesh.max_primitives * 3u, 1u);
+		if (emulated_batching) {
+			for (uint32_t instance = 0; instance < draw.instance_count;) {
+				const auto instances = std::min(draw.instance_count - instance, emulated_instance_limit);
+				for (uint32_t first_group = 0; first_group < mesh_groups;) {
+					const auto count = std::min(mesh_groups - first_group, emulated_group_limit);
+					buffer.EndRendering();
+					const std::array<uint32_t, MeshEmulationLayout::HeaderDwords> header{
+					    first_group, instance, mesh_groups, draw.instance_count};
+					if (emulated_header != PushData::NoStart) {
+						vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
+						    emulated_header * sizeof(uint32_t), sizeof(header), header.data());
+					} else {
+						const vk::MemoryBarrier to_header{
+						    .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+						    .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
+						vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+						    vk::PipelineStageFlagBits::eTransfer, {}, 1u, &to_header, 0u, nullptr, 0u, nullptr);
+						const vk::BufferCopy copy{emulated_header_offset, 0u, sizeof(header)};
+						vk_buffer.copyBuffer(emulated_header_buffer, storage.Handle(), 1u, &copy);
+						emulated_header_offset += sizeof(header);
+					}
+					// Wait for earlier reads and header copies before reusing the scratch records.
+					ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+					vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.mesh_compute_pipeline);
+					vk_buffer.dispatch(count, instances, 1u);
+					ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+					buffer.BeginRendering(rendering);
+					vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+					const auto query = queries.Begin(vk_buffer);
+					vk_buffer.draw(count * mesh.max_primitives * 3u, instances, 0u, 0u);
+					if (tessellation) {
+						m_context.RecordTessellationDraw(count * mesh.max_primitives * 3u, instances);
+						record_tessellation_reason();
+					} else if (state.per_vertex_buffer) {
+						Common::DebugCounters::Add(Common::DebugCounters::Counter::MeshBufferDraws);
+					}
+					queries.End(vk_buffer, query);
+					buffer.EndRendering();
+					if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage))
+						ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eFragmentShader);
+					first_group += count;
 				}
-				queries.End(vk_buffer, query);
-				buffer.EndRendering();
-				if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage))
-					ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eFragmentShader);
-				first_group += count;
+				instance += instances;
+			}
+		} else {
+			for (uint32_t instance = 0; instance < draw.instance_count; ++instance) {
+				for (uint32_t first_group = 0; first_group < mesh_groups;) {
+					const auto count = std::min(mesh_groups - first_group, emulated_group_limit);
+					buffer.EndRendering();
+					// The scratch region is reused only after all preceding shader accesses finish.
+					const vk::MemoryBarrier to_header{
+					    .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+					    .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
+					vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+					    vk::PipelineStageFlagBits::eTransfer, {}, 1u, &to_header, 0u, nullptr, 0u, nullptr);
+					const std::array<uint32_t, MeshEmulationLayout::HeaderDwords> header{
+					    first_group, instance, mesh_groups, draw.instance_count};
+					vk_buffer.updateBuffer(storage.Handle(), 0u, sizeof(header), header.data());
+					ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+					vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.mesh_compute_pipeline);
+					vk_buffer.dispatch(count, 1u, 1u);
+					ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+					buffer.BeginRendering(rendering);
+					vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+					const auto query = queries.Begin(vk_buffer);
+					vk_buffer.draw(count * mesh.max_primitives * 3u, 1u, 0u, 0u);
+					if (tessellation) {
+						m_context.RecordTessellationDraw(count * mesh.max_primitives * 3u, 1u);
+						record_tessellation_reason();
+					} else if (state.per_vertex_buffer) {
+						Common::DebugCounters::Add(Common::DebugCounters::Counter::MeshBufferDraws);
+					}
+					queries.End(vk_buffer, query);
+					buffer.EndRendering();
+					if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage))
+						ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eFragmentShader);
+					first_group += count;
+				}
 			}
 		}
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 		isolate_wait();
 		return;
+	}
+	if (state.vertex_store) {
+		auto& storage = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::DeviceLocal);
+		buffer.EndRendering();
+		// The scratch buffer also serves mesh emulation. Finish all earlier readers before reuse.
+		const vk::MemoryBarrier before{
+		    .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		    .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		    vk::PipelineStageFlagBits::eTransfer, {}, 1u, &before, 0u, nullptr, 0u, nullptr);
+		const uint64_t header_bytes = vertex_store_header.size() * sizeof(uint32_t);
+		for (uint64_t offset = 0; offset < header_bytes;) {
+			const auto bytes = std::min<uint64_t>(65536u, header_bytes - offset);
+			vk_buffer.updateBuffer(storage.Handle(), offset, bytes,
+			    reinterpret_cast<const uint8_t*>(vertex_store_header.data()) + offset);
+			offset += bytes;
+		}
+		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eVertexShader);
+		const vk::DescriptorBufferInfo info{storage.Handle(), 0u, vertex_store_plan.bytes};
+		const auto set = m_context.GetDescriptorHeap().Commit(pipeline.vertex_store_layout);
+		const vk::WriteDescriptorSet write{.dstSet = set, .dstBinding = MeshEmulationBinding,
+		    .descriptorCount = 1u, .descriptorType = vk::DescriptorType::eStorageBuffer,
+		    .pBufferInfo = &info};
+		m_context.GetGraphics().device.updateDescriptorSets(1u, &write, 0u, nullptr);
+		vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout,
+		    VertexStoreSet, 1u, &set, 0u, nullptr);
+		RenderState capture_rendering{};
+		capture_rendering.width = capture_rendering.height = 1u;
+		buffer.BeginRendering(capture_rendering);
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.vertex_store_pipeline);
+		EmitDrawPrimitives(ucfg, vk_buffer, host_draw, emit);
+		buffer.EndRendering();
+		ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eVertexShader);
 	}
 	buffer.BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
@@ -1345,6 +1552,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+	} else if (state.vertex_store) {
+		vk_buffer.draw(host_draw.index_count, host_draw.instance_count, 0u, emit.first_instance);
 	} else if (args_buffer.first == nullptr) {
 		EmitDrawPrimitives(ucfg, vk_buffer, host_draw, emit);
 	} else if (draw.indexed) {
@@ -1358,6 +1567,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (tessellation) {
 		m_context.RecordTessellationDraw(host_draw.index_count, draw.instance_count,
 		                                emit.indirect.address != 0);
+		record_tessellation_reason();
+	} else if (state.vertex_store) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::VsStoreNativeDraws);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
@@ -1484,8 +1696,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 		return true;
 	}
 
-	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
-	                     args.index_addr);
+	LogDrawStateIfNeeded(buffer, draw, state, m_targets, args.index_type_and_size, args.index_addr);
 	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
 	                                  args.base_vertex, args.first_instance, args.indirect);
 	if (emit) {
@@ -1564,7 +1775,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 		return true;
 	}
 
-	LogDrawStateIfNeeded(buffer, draw, state, 0, nullptr);
+	LogDrawStateIfNeeded(buffer, draw, state, m_targets, 0, nullptr);
 	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
 	                                  static_cast<int32_t>(args.first_vertex), args.first_instance,
 	                                  args.indirect);

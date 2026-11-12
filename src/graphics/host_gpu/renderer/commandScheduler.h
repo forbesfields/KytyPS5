@@ -25,9 +25,19 @@ public:
 	void           EndRendering() { m_command.EndRendering(); }
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
+	// Only a complete slice with another ready slice on the same guest queue can be batched.
+	void           FlushSlice(bool next_slice_ready);
+	[[nodiscard]] bool HasDeferredSlices() const noexcept { return m_deferred_slices != 0; }
+	struct GpuThreadWaitStats {
+		uint64_t count;
+		uint64_t nanoseconds;
+	};
+	[[nodiscard]] static GpuThreadWaitStats GetGpuThreadWaitStats();
 	void           Finish();
-	// At a frame boundary, release driver allocations that live as long as the pool.
+	// Retire a pool at an operation boundary, after submitting its current recording.
 	void           RecreateCommandPool();
+	void           AdvanceCommandPoolFrame();
+	[[nodiscard]] bool PoolRingEnabled() const noexcept { return m_pool_ring_enabled; }
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
@@ -56,23 +66,38 @@ public:
 private:
 	class CommandPool {
 	public:
-		CommandPool(GraphicContext& graphics, MasterSemaphore& master);
+		CommandPool(GraphicContext& graphics, MasterSemaphore& master, bool use_ring);
 		~CommandPool();
 		KYTY_CLASS_NO_COPY(CommandPool);
 
 		vk::CommandBuffer Commit();
 		void Recreate();
+		void ReleaseCompletedPools(bool frame_boundary = false, bool need_space = false);
 
 	private:
 		static constexpr size_t GrowStep = 4;
 
+		struct RetiredPool {
+			vk::CommandPool pool;
+			vk::Fence       fence;
+			uint64_t        tick;
+			uint64_t        frame;
+		};
+
 		size_t Grow();
+		vk::CommandPool CreatePool();
+		vk::Fence CompletionCheckpoint();
+		void WaitCheckpoint(vk::Fence fence);
+		void DestroyRetiredPool();
 
 		GraphicContext&                m_graphics;
 		MasterSemaphore&               m_master;
+		const bool                     m_use_ring;
 		vk::CommandPool                m_pool = nullptr;
 		std::vector<vk::CommandBuffer> m_buffers;
 		std::vector<uint64_t>          m_ticks;
+		std::queue<RetiredPool>        m_retired_pools;
+		uint64_t                      m_frame = 0;
 		size_t                         m_hint = 0;
 	};
 
@@ -83,6 +108,7 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	void WaitForGpu(uint64_t tick);
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
@@ -91,9 +117,11 @@ private:
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
+	const bool                   m_pool_ring_enabled;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
+	uint32_t                     m_deferred_slices = 0;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

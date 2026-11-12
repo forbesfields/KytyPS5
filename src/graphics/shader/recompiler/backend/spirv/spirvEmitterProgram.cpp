@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/perVertexVsStore.h"
 
 #include <algorithm>
 #include <bit>
@@ -82,7 +83,74 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 	}
 }
 
+void EmitVertexStore(ValueEmitContext& ctx) {
+	auto& state = ctx.state;
+	if (!state.pv_store.vertex_store || state.program.stage != ShaderType::Vertex) return;
+	const auto header = [&](uint32_t index) { return EmitMeshEmulationHeaderLoad(state, index); };
+	const auto vertex = EmitGetBuiltin(ctx, IR::Value{static_cast<uint32_t>(IR::StageInputKind::VertexIndex)},
+	                                   IR::Value{0u});
+	const auto instance = EmitGetBuiltin(ctx, IR::Value{static_cast<uint32_t>(IR::StageInputKind::InstanceIndex)},
+	                                     IR::Value{0u});
+	const auto relative_vertex = Binary(state, spv::OpISub, TypeU32(state), vertex, header(VertexStoreFirst));
+	const auto relative_instance = Binary(state, spv::OpISub, TypeU32(state), instance,
+	                                      header(VertexStoreFirstInstance));
+	const auto record = Binary(state, spv::OpIAdd, TypeU32(state), relative_vertex,
+	    Binary(state, spv::OpIMul, TypeU32(state), relative_instance, header(VertexStoreSpan)));
+	const auto base = Binary(state, spv::OpIAdd, TypeU32(state), header(VertexStoreRecords),
+	    Binary(state, spv::OpIMul, TypeU32(state), record, header(VertexStoreStride)));
+	const auto layout = BuildVertexStoreLayout(state.program.info.outputs, state.input_info.vertex->user_clip_planes);
+	for (const auto& field : layout.fields) {
+		const auto output = std::ranges::find_if(state.outputs, [&](const auto& candidate) {
+			return candidate.kind == field.output.kind && candidate.index == field.output.index;
+		});
+		EXIT_IF(output == state.outputs.end());
+		auto pointer = output->variable_id;
+		const bool vector = output->kind == IR::StageOutputKind::Position ||
+		                    output->kind == IR::StageOutputKind::Parameter;
+		const bool integer = output->kind == IR::StageOutputKind::Layer ||
+		                     output->kind == IR::StageOutputKind::ViewportIndex;
+		const auto type = vector ? TypeF32Vector(state, 4u) : integer ? TypeU32(state) : TypeF32(state);
+		if (output->kind == IR::StageOutputKind::Position) {
+			pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, type),
+			                          pointer, output->variable_id, ConstantU32(state, 0u));
+		} else if (output->kind == IR::StageOutputKind::ClipDistance ||
+		           output->kind == IR::StageOutputKind::CullDistance) {
+			pointer = state.builder.AllocateId();
+			if (output->kind == IR::StageOutputKind::ClipDistance && state.clip_distance_in_per_vertex)
+				state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, type),
+				                          pointer, output->variable_id, ConstantU32(state, 1u),
+				                          ConstantU32(state, output->index));
+			else
+				state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, type),
+				                          pointer, output->variable_id, ConstantU32(state, output->index));
+		}
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, type, value, pointer);
+		const auto bits = integer ? value : Unary(state, spv::OpBitcast,
+		    vector ? TypeU32Vector(state, 4u) : TypeU32(state), value);
+		for (uint32_t component = 0; component < (vector ? 4u : 1u); ++component) {
+			auto word = bits;
+			if (vector) {
+				word = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), word, bits, component);
+			}
+			const auto address = Binary(state, spv::OpIAdd, TypeU32(state), base,
+			                             ConstantU32(state, field.offset + component));
+			const auto target = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain,
+			    TypePointer(state, spv::StorageClassStorageBuffer, TypeU32(state)), target,
+			    state.mesh_output_buffer, ConstantU32(state, 0u), address);
+			// Indexed draws can run a vertex more than once. Atomic replacement avoids a data
+			// race between duplicate invocations. No consumer runs until the command barrier.
+			state.builder.AddFunction(spv::OpAtomicExchange, TypeU32(state), state.builder.AllocateId(),
+			    target, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0u), word);
+		}
+	}
+}
+
 void EmitReturn(ValueEmitContext& ctx) {
+	EmitVertexStore(ctx);
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	if (ctx.state.object_primitive_id_variable != 0) {
 		auto& state = ctx.state;

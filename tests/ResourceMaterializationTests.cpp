@@ -108,7 +108,6 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UnbasedFlatPlan() {
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
   AddValueBlock(program);
-  program.info.uses_dma = true;
   return Extract(program);
 }
 
@@ -1552,7 +1551,15 @@ void DbgExitIfHandler(const char *, const char *, int) { std::abort(); }
 
 } // namespace Common
 
-int main() {
+#include "SrtWalkerPerformanceTests.inc"
+
+int main(int argc, char **argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--benchmark-srt") == 0) {
+    BenchmarkDrawResources();
+    return 0;
+  }
+  TestDrawResourceWalkRefresh();
+  TestSharedOperandRefresh();
   TestWalkerLoadsBypassSpecializationReader();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();

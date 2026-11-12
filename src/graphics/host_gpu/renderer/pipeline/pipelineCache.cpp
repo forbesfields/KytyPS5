@@ -13,6 +13,8 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/perVertexVsStore.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -29,6 +31,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -44,6 +47,52 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {1};
+
+bool PerVertexBufferEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PERF_VS_STORE");
+		const bool active = value == nullptr || std::strcmp(value, "0") != 0;
+		Log::WriteToConsoleAndLog(fmt::format("KYTY_PERF_VS_STORE={} (raw corner buffers)\n",
+		                                     active ? "1" : "0"));
+		return active;
+	}();
+	return enabled;
+}
+
+bool NativeVertexStoreEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PERF_VS_STORE_NATIVE");
+		const bool active = value == nullptr || std::strcmp(value, "0") != 0;
+		Log::WriteToConsoleAndLog(fmt::format("KYTY_PERF_VS_STORE_NATIVE={} (native vertex capture)\n",
+		                                     active ? "1" : "0"));
+		return active;
+	}();
+	return enabled;
+}
+
+bool CornerBufferDescriptorsFit(const vk::PhysicalDeviceLimits& limits, const ShaderModule& vertex,
+                                const ShaderModule& pixel, bool native_store) {
+	if (native_store && limits.maxBoundDescriptorSets < 3u) return false;
+	uint64_t total_buffers = 1u; // One shared output buffer, visible in each consuming stage.
+	const auto fits_stage = [&](const ShaderModule& module) {
+		uint64_t buffers = 1u, resources = 1u;
+		for (auto mask = module.info.bindings.descriptor_mask; mask != 0; mask &= mask - 1u) {
+			const auto index = std::countr_zero(mask);
+			const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
+			const auto type = NativeDescriptorType(kind);
+			const auto count = module.info.bindings.descriptor_counts[index];
+			if (type == vk::DescriptorType::eStorageBuffer) {
+				buffers += count;
+				total_buffers += count;
+			}
+			if (type != vk::DescriptorType::eSampler) resources += count;
+		}
+		return buffers <= limits.maxPerStageDescriptorStorageBuffers &&
+		       resources <= limits.maxPerStageResources;
+	};
+	return fits_stage(vertex) && fits_stage(pixel) &&
+	       total_buffers <= limits.maxDescriptorSetStorageBuffers;
+}
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -234,6 +283,14 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 
 } // namespace
 
+uint32_t PerVertexBufferMode(bool emulated_mesh, bool native_candidate) {
+	const bool enabled = PerVertexBufferEnabled();
+	const bool native = NativeVertexStoreEnabled();
+	if (!enabled) return 0u;
+	if (emulated_mesh) return 1u;
+	return native_candidate && native ? 2u : 0u;
+}
+
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
 	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
@@ -307,14 +364,21 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
 ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& key,
                                            ShaderRecompiler::CompileOptions  options,
                                            ShaderRecompiler::TranslateResult translated,
-                                           uint32_t                          push_data_cursor) {
+                                           uint32_t                          push_data_cursor,
+                                           uint32_t                          per_vertex_mode) {
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 	                                         Common::DebugCounters::Counter::ShaderCompileNs,
 	                                         Common::DebugCounters::Peak::ShaderCompileNs);
 	const auto profile = SpirvProfile(m_graphics);
-	options.profile    = &profile;
+	options.profile = &profile;
 	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 	                                               program.specialization, push_data_cursor);
+	const ShaderRecompiler::Spirv::PvStoreInfo pv_store{
+	    .per_vertex_buffer = per_vertex_mode != 0 && key.stage == ShaderType::Pixel,
+	    .vertex_store = per_vertex_mode == 2u};
+	if (per_vertex_mode != 0)
+		result.spirv = ShaderRecompiler::Spirv::EmitProgram(result.program, options.input_info,
+		    push_data_cursor, profile, options.emit_debug_info, pv_store);
 	auto info = std::move(result.program).TakeCompiledInfo();
 
 	// The same inputs give the same module id across runs.
@@ -348,6 +412,9 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	// The inputs of these come from the stage's static key.
 	if (key.stage == ShaderType::Vertex || key.stage == ShaderType::Local) {
 		module.vertex_formats = VertexInputFormats(*options.input_info.vertex, module.info);
+		if (pv_store.vertex_store)
+			module.mesh_layout = BuildVertexStoreLayout(module.info.info.outputs,
+			                                             options.input_info.vertex->user_clip_planes);
 	} else if (key.stage == ShaderType::Pixel &&
 	           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
 		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
@@ -370,7 +437,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
-                                              uint32_t& push_data_cursor) {
+                                              uint32_t& push_data_cursor, uint32_t per_vertex_mode) {
 	const auto user_data = std::span(params.user_data).first(params.user_data_count);
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
@@ -404,6 +471,17 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
+	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+		if (options.stage == ShaderType::Mesh && input_info.mesh.emulated &&
+		    MeshEmulationHeaderDword(input_info.user_clip_planes) != ShaderRecompiler::IR::PushData::NoStart) {
+			// Spilled shader data has the same push cursor in both modes. Keep its modules apart.
+			m_lookup_key.static_state.push_back(0x4d424154u); // MBAT
+		}
+	}
+	// The module store must keep the buffer and tessellation interfaces apart.
+	if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo> ||
+	              std::is_same_v<InputInfo, ShaderVertexInputInfo>)
+		m_lookup_key.static_state.push_back(per_vertex_mode);
 	auto entry = m_program_cache.find(m_lookup_key);
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
@@ -473,7 +551,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		}
 	}
 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
-	                          push_data_cursor));
+	                          push_data_cursor, per_vertex_mode));
 }
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
@@ -482,6 +560,8 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
     : m_graphics(graphics), m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	(void)MeshEmulationBatchEnabled();
+	(void)PerVertexBufferMode(false, false);
 	InitializeDriverCache();
 	WarmUp(shader_store);
 }
@@ -492,6 +572,9 @@ PipelineCache::~PipelineCache() {
 		for (const auto& pipeline: pipelines | std::views::values) {
 			m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
 			m_graphics.device.destroyPipeline(pipeline.mesh_compute_pipeline, nullptr);
+			m_graphics.device.destroyPipeline(pipeline.vertex_store_pipeline, nullptr);
+			m_graphics.device.destroyDescriptorSetLayout(pipeline.vertex_store_layout, nullptr);
+			m_graphics.device.destroyDescriptorSetLayout(pipeline.vertex_store_gap, nullptr);
 			m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
 			m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
 		}
@@ -687,6 +770,10 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	     db.shader_mask_export_enable || db.shader_dual_export_enable ||
 	     db.shader_execute_on_noop || sh.AlphaToMask());
 	state.ps_active = pixel_active;
+	state.per_vertex_buffer = state.vertex_store = false;
+	if (!state.force_corner_tessellation) {
+		state.corner_tessellation_reason = CornerTessellationReason::Other;
+	}
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -894,8 +981,26 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
+	if (mesh_active && vertex_info[0].mesh.emulated &&
+	    MeshEmulationHeaderDword(last_stage.user_clip_planes) != ShaderRecompiler::IR::PushData::NoStart)
+		push_data_cursor += MeshEmulationLayout::HeaderDwords;
 	if (pixel_active) {
-		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
+		const auto per_vertex_mode = !state.force_corner_tessellation && pixel_info.emulate_per_vertex
+		    ? PerVertexBufferMode(mesh_active && vertex_info[0].mesh.emulated,
+		                          !mesh_active && !tess_active && !vertex_info[0].indirect_draw)
+		    : 0u;
+		if (!state.force_corner_tessellation && pixel_info.emulate_per_vertex && per_vertex_mode == 0u) {
+			if (!PerVertexBufferEnabled() || (!mesh_active && !NativeVertexStoreEnabled())) {
+				state.corner_tessellation_reason = CornerTessellationReason::SwitchOff;
+			} else if (!mesh_active && vertex_info[0].indirect_draw) {
+				state.corner_tessellation_reason = CornerTessellationReason::Indirect;
+			}
+		}
+		state.vertex_store = per_vertex_mode == 2u;
+		state.per_vertex_buffer = per_vertex_mode != 0u;
+		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor, per_vertex_mode);
+		state.per_vertex_buffer &= !pixel_module.triangle_parameters.empty();
+		state.vertex_store &= state.per_vertex_buffer;
 		for (const auto& output: pixel_module.info.info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
 			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
@@ -905,7 +1010,39 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		state.mrt_mask &= color_output_mask;
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor);
+		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor, state.vertex_store ? 2u : 0u);
+	}
+	if (state.per_vertex_buffer) {
+		const auto& vertex = *vertex_info[0].stage.module;
+		const auto& info = vertex.info.info;
+		// A cached record must be independent of invocation order and subgroup membership.
+		const bool capture_unsupported = state.vertex_store &&
+		    (vertex.info.has_address_writes || info.uses_gds || info.subgroup_ballot ||
+		     info.subgroup_vote || info.subgroup_barrier || info.subgroup_shuffle ||
+		     info.subgroup_arithmetic || info.subgroup_local_invocation_id ||
+		     std::ranges::any_of(info.buffers, [](const auto& buffer) { return buffer.written; }) ||
+		     std::ranges::any_of(info.images, [](const auto& image) { return image.written; }) ||
+		     std::ranges::any_of(info.outputs, [](const auto& output) {
+			     using Kind = ShaderRecompiler::IR::StageOutputKind;
+			     return output.kind != Kind::Position && output.kind != Kind::Parameter &&
+			            output.kind != Kind::ClipDistance && output.kind != Kind::Layer;
+		     }));
+		if (capture_unsupported || !CornerBufferDescriptorsFit(
+		        m_graphics.GetPhysicalDeviceProperties().limits, vertex,
+		        *pixel_info.stage.module, state.vertex_store)) {
+			state.corner_tessellation_reason = CornerTessellationReason::Other;
+			if (capture_unsupported) {
+				const bool output_unsupported = std::ranges::any_of(info.outputs, [](const auto& output) {
+					using Kind = ShaderRecompiler::IR::StageOutputKind;
+					return output.kind != Kind::Position && output.kind != Kind::Parameter &&
+					       output.kind != Kind::ClipDistance && output.kind != Kind::Layer;
+				});
+				state.corner_tessellation_reason = output_unsupported
+				    ? CornerTessellationReason::OutputKind : CornerTessellationReason::SideEffects;
+			}
+			state.force_corner_tessellation = true;
+			GetGraphicsPrograms(command, state);
+		}
 	}
 }
 
@@ -920,9 +1057,10 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 }
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
-                                                            const DrawRenderState& state) {
-	const auto* colors        = state.color_info;
-	const auto& depth         = state.depth_info;
+                                                            const DrawRenderState& state,
+                                                            const DrawTargets&     targets) {
+	const auto* colors        = targets.colors;
+	const auto& depth         = targets.depth;
 	const auto  vertex_info   = state.VertexStages();
 	const auto& ps_input_info = state.ps_input_info;
 	const auto& vs_input_info = vertex_info.front();
@@ -938,7 +1076,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		stages[3] = ps_input_info.stage.module;
 	}
 	const bool mesh        = stages[0]->info.stage == ShaderType::Mesh;
-	const auto color_count = state.color_count;
+	const auto color_count = targets.color_count;
 
 	auto&             ctx = command.GetRegisters();
 
@@ -1049,11 +1187,13 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
 	static_params.topology                 = state.topology;
 	static_params.primitive_restart_enable = state.primitive_restart_enable;
-	if (stages[0]->MeshEmulated()) {
+	static_params.per_vertex_buffer        = state.per_vertex_buffer;
+	static_params.vertex_store             = state.vertex_store;
+	if (stages[0]->MeshEmulated() || state.vertex_store) {
 		static_params.topology = vk::PrimitiveTopology::eTriangleList;
 		static_params.primitive_restart_enable = false;
 	}
-	if (ps_active && !stages[3]->triangle_parameters.empty()) {
+	if (ps_active && !stages[3]->triangle_parameters.empty() && !state.per_vertex_buffer) {
 		EXIT_IF(tessellation || (mesh && !stages[0]->MeshEmulated()) ||
 		        (static_params.topology != vk::PrimitiveTopology::eTriangleList &&
 		         static_params.topology != vk::PrimitiveTopology::eTriangleStrip &&

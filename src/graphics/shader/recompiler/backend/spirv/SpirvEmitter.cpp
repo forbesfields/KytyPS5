@@ -21,7 +21,7 @@ namespace {
 
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword, const Profile& profile,
-                                  bool emit_debug_info) {
+                                  bool emit_debug_info, const PvStoreInfo& pv_store) {
 	using namespace Emitter;
 
 	if (!program.srt_plan_complete || !program.resource_tracking_complete ||
@@ -31,6 +31,11 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	IR::ValidateProgram(program);
 	program.bindings = {.push_data_start_dword = push_data_start_dword};
 	EmitterState state(program, input_info, profile);
+	state.pv_store = pv_store;
+	if ((pv_store.per_vertex_buffer && (program.stage != ShaderType::Pixel ||
+	     input_info.pixel == nullptr || !input_info.pixel->emulate_per_vertex)) ||
+	    (pv_store.vertex_store && program.stage != ShaderType::Vertex && program.stage != ShaderType::Pixel))
+		Fail(program, "invalid per-vertex buffer stage or interface");
 	if (emit_debug_info) {
 		char name[64];
 		std::snprintf(name, sizeof(name), "rdna2-%016" PRIx64 "-block-byte-pc-plus-one",

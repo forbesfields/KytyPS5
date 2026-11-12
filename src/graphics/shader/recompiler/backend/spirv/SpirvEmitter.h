@@ -41,11 +41,20 @@ inline constexpr Profile DefaultProfile {};
 	}
 }
 
+// Raw corner inputs are flat DWORD addresses. A separate producer and command barrier must
+// finish before fragment reads. The native capture path uses private descriptor set 2.
+struct PvStoreInfo {
+	bool per_vertex_buffer = false;
+	bool vertex_store = false;
+};
+inline constexpr PvStoreInfo DefaultPvStoreInfo{};
+
 // Resets and writes backend IDs and descriptor indices; do not emit the same program concurrently.
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t       push_data_start_dword = 0,
                                   const Profile& profile               = DefaultProfile,
-                                  bool           emit_debug_info       = false);
+                                  bool           emit_debug_info       = false,
+                                  const PvStoreInfo& pv_store           = DefaultPvStoreInfo);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

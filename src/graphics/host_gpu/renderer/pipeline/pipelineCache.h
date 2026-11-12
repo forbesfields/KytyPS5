@@ -58,6 +58,9 @@ struct PipelineStaticParameters {
 	// 0 without tessellation, 3 for a rectangle list, else the input control points.
 	uint32_t                   patch_control_points     = 0;
 	bool                       primitive_restart_enable = false;
+	bool                       per_vertex_buffer        = false;
+	bool                       vertex_store             = false;
+	uint16_t                   corner_reserved          = 0; // Keep the packed cache key aligned.
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
 	bool                       alpha_to_coverage_enable = false;
@@ -133,16 +136,29 @@ struct ShaderModule {
 	[[nodiscard]] bool MeshEmulated() const { return mesh_layout.max_vertices != 0u; }
 };
 
-// A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
+// A draw's depth target and its first color_count color targets.
+struct DrawTargets {
+	RenderDepthInfo depth;
+	RenderColorInfo colors[RENDER_COLOR_ATTACHMENTS_MAX];
+	uint32_t        color_count = 0;
+};
+
+enum class CornerTessellationReason {
+	Other, Indirect, PrimitiveRestart, CaptureRange, OutputKind, SideEffects, SwitchOff
+};
+
+// A draw's topology and shader stages (from PipelineCache::GetGraphicsPrograms).
 struct DrawRenderState {
-	RenderDepthInfo                      depth_info;
-	RenderColorInfo                      color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	uint32_t                             color_count                              = 0;
 	// Color targets the pixel program writes.
-	uint32_t                             mrt_mask                                 = 0;
+	uint32_t                             mrt_mask = 0;
 	vk::PrimitiveTopology                topology = vk::PrimitiveTopology::ePointList;
 	bool                                 primitive_restart_enable                 = false;
 	bool                                 ps_active                                = false;
+	bool                                 per_vertex_buffer                        = false;
+	bool                                 vertex_store                             = false;
+	// Retry draws that do not fit the capture buffer with the old tessellation interface.
+	bool                                 force_corner_tessellation                = false;
+	CornerTessellationReason              corner_tessellation_reason = CornerTessellationReason::Other;
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo                 ps_input_info;
 	// Input: the user-data slots a GPU-read indirect draw patches.
@@ -195,6 +211,9 @@ public:
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
 		vk::Pipeline            mesh_compute_pipeline = nullptr;
+		vk::Pipeline            vertex_store_pipeline = nullptr;
+		vk::DescriptorSetLayout vertex_store_layout   = nullptr;
+		vk::DescriptorSetLayout vertex_store_gap      = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		// The push constant range's stages, which every update names.
 		vk::ShaderStageFlags    push_stages;
@@ -208,7 +227,8 @@ public:
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
 
-	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
+	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
+	                              const DrawTargets& targets);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
 private:
@@ -267,11 +287,12 @@ private:
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
-	                               uint32_t& push_data_cursor);
+	                               uint32_t& push_data_cursor, uint32_t per_vertex_mode = 0);
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,
-	                            uint32_t                          push_data_cursor);
+	                            uint32_t                          push_data_cursor,
+	                            uint32_t                          per_vertex_mode);
 	void InitializeDriverCache();
 	// Marks the driver cache changed and, once per interval, has the store thread write it.
 	void CheckpointDriverCache();

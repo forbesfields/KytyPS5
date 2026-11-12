@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/perVertexVsStore.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -78,12 +79,18 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 
 // Creates the descriptor set layout and the pipeline layout that uses it.
 static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                          std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+                          std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                          bool vertex_store = false) {
 	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
 	uint64_t descriptor_count = 0;
-	uint64_t storage_buffers = 0;
+	uint64_t storage_buffers = vertex_store ? 1u : 0u;
 	uint64_t samplers = 0;
 	std::array<uint64_t, 32> stage_buffers {}, stage_resources {}, stage_samplers {};
+	if (vertex_store) {
+		for (const auto stage : {0u, 4u}) { // Vertex and fragment bit indices.
+			stage_buffers[stage] = stage_resources[stage] = 1u;
+		}
+	}
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
 		const bool storage = binding.descriptorType == vk::DescriptorType::eStorageBuffer;
@@ -132,10 +139,26 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
 	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
-	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
+	std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout,
+	                       vk::DescriptorSetLayout{}};
+	if (vertex_store) {
+		const vk::DescriptorSetLayoutBinding binding{MeshEmulationBinding,
+		    vk::DescriptorType::eStorageBuffer, 1u,
+		    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment};
+		const vk::DescriptorSetLayoutCreateInfo store_info{.bindingCount = 1u, .pBindings = &binding};
+		EXIT_IF(graphics.device.createDescriptorSetLayout(&store_info, nullptr,
+		    &pipeline.vertex_store_layout) != vk::Result::eSuccess);
+		set_layouts[2] = pipeline.vertex_store_layout;
+		if (!pipeline.uses_image_heap) {
+			const vk::DescriptorSetLayoutCreateInfo empty{};
+			EXIT_IF(graphics.device.createDescriptorSetLayout(&empty, nullptr,
+			    &pipeline.vertex_store_gap) != vk::Result::eSuccess);
+			set_layouts[1] = pipeline.vertex_store_gap;
+		}
+	}
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = pipeline.uses_image_heap ? 2u : 1u;
+	pipeline_layout_info.setLayoutCount         = vertex_store ? 3u : pipeline.uses_image_heap ? 2u : 1u;
 	pipeline_layout_info.pSetLayouts            = set_layouts.data();
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
@@ -160,11 +183,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const bool  emulated_mesh = vertex.MeshEmulated();
 	const bool  mesh          = vertex.info.stage == ShaderType::Mesh && !emulated_mesh;
 	EXIT_NOT_IMPLEMENTED(mesh && !graphics.mesh_shader_enabled);
-	const auto mesh_vertex_module = emulated_mesh
-	    ? CompileSPV(BuildMeshEmulationVertexShader(vertex.mesh_layout,
-	                                               vertex.mesh_layout.provoking_vertex), graphics.device)
+	const auto corner_parameters = static_params.per_vertex_buffer && pixel
+	    ? std::span<const TriangleParameter>(pixel->triangle_parameters)
+	    : std::span<const TriangleParameter>{};
+	const auto mesh_vertex_module = static_params.vertex_store
+	    ? CompileSPV(BuildVertexStoreVertexShader(vertex.mesh_layout,
+	        static_params.provoking_vtx_last ? 2u : 0u, corner_parameters), graphics.device)
+	    : emulated_mesh ? CompileSPV(BuildMeshEmulationVertexShader(vertex.mesh_layout,
+	        vertex.mesh_layout.provoking_vertex, corner_parameters), graphics.device)
 	    : vk::ShaderModule{};
-	const bool triangle_corners = pixel != nullptr && !pixel->triangle_parameters.empty();
+	const bool triangle_corners = pixel != nullptr && !pixel->triangle_parameters.empty() &&
+	                              !static_params.per_vertex_buffer;
 	const bool rect_list = !triangle_corners && static_params.patch_control_points != 0 && stages[1] == nullptr;
 
 	vk::ShaderModule tess_control_shader_module = nullptr;
@@ -193,7 +222,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		if (stage != nullptr) {
 			shader_stages[shader_stage_count++] = {
 			    .stage = stage->MeshEmulated() ? vk::ShaderStageFlagBits::eVertex : NativeShaderStage(stage->info.stage),
-			    .module = stage->MeshEmulated() ? mesh_vertex_module : stage->module,
+			    .module = stage->MeshEmulated() || (stage == &vertex && static_params.vertex_store)
+			        ? mesh_vertex_module : stage->module,
 			    .pName = "main"};
 		}
 	}
@@ -259,7 +289,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	rasterizer.pNext = &clip_ext;
 #endif
 	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex {};
-	EXIT_NOT_IMPLEMENTED(static_params.provoking_vtx_last &&
+	EXIT_NOT_IMPLEMENTED(static_params.provoking_vtx_last && !static_params.per_vertex_buffer &&
 	                     !graphics.provoking_vertex_last_enabled);
 	if (graphics.provoking_vertex_last_enabled) {
 		provoking_vertex.provokingVertexMode = static_params.provoking_vtx_last
@@ -321,9 +351,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (emulated_mesh) {
 		pipeline.push_stages |= vk::ShaderStageFlagBits::eVertex;
 		descriptor_bindings.push_back({MeshEmulationBinding, vk::DescriptorType::eStorageBuffer, 1u,
-		    vk::ShaderStageFlagBits::eCompute | vk::ShaderStageFlagBits::eVertex, nullptr});
+		    vk::ShaderStageFlagBits::eCompute | vk::ShaderStageFlagBits::eVertex |
+		        (static_params.per_vertex_buffer ? vk::ShaderStageFlagBits::eFragment : vk::ShaderStageFlags{}),
+		    nullptr});
 	}
-	CreateLayouts(graphics, pipeline, descriptor_bindings);
+	CreateLayouts(graphics, pipeline, descriptor_bindings, static_params.vertex_store);
 	if (emulated_mesh) {
 		vk::ComputePipelineCreateInfo compute_info{};
 		compute_info.stage = {.stage = vk::ShaderStageFlagBits::eCompute, .module = vertex.module,
@@ -375,7 +407,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pNext                    = &rendering_info;
 	pipeline_info.stageCount               = shader_stage_count;
 	pipeline_info.pStages                  = shader_stages;
-	pipeline_info.pVertexInputState        = mesh ? nullptr : &vertex_input_info;
+	const vk::PipelineVertexInputStateCreateInfo consumer_input{};
+	pipeline_info.pVertexInputState        = mesh ? nullptr : static_params.vertex_store
+	    ? &consumer_input : &vertex_input_info;
 	pipeline_info.pInputAssemblyState      = mesh ? nullptr : &input_assembly;
 	vk::PipelineTessellationStateCreateInfo tessellation_state {};
 	tessellation_state.patchControlPoints = static_params.patch_control_points;
@@ -398,6 +432,27 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     static_cast<uint32_t>(static_params.topology), static_params.patch_control_points,
 		     vertex.id, pixel ? pixel->id : uint64_t{0}, mesh, emulated_mesh,
 		     pixel ? pixel->triangle_parameters.size() : size_t{0}, rect_list);
+	}
+
+	if (static_params.vertex_store) {
+		// Capture has no framebuffer attachments. The draw writes only the private records.
+		// Its consumer uses the same resource layout after an explicit vertex-write barrier.
+		const vk::PipelineShaderStageCreateInfo capture_stage{
+		    .stage = vk::ShaderStageFlagBits::eVertex, .module = vertex.module, .pName = "main"};
+		const vk::PipelineRenderingCreateInfo capture_rendering{};
+		const vk::PipelineMultisampleStateCreateInfo capture_samples{
+		    .rasterizationSamples = vk::SampleCountFlagBits::e1};
+		const vk::PipelineColorBlendStateCreateInfo capture_blend{};
+		rasterizer.rasterizerDiscardEnable = true;
+		pipeline_info.pNext = &capture_rendering;
+		pipeline_info.stageCount = 1u;
+		pipeline_info.pStages = &capture_stage;
+		pipeline_info.pVertexInputState = &vertex_input_info;
+		pipeline_info.pMultisampleState = &capture_samples;
+		pipeline_info.pDepthStencilState = nullptr;
+		pipeline_info.pColorBlendState = &capture_blend;
+		EXIT_IF(graphics.device.createGraphicsPipelines(driver_cache, 1u, &pipeline_info, nullptr,
+		    &pipeline.vertex_store_pipeline) != vk::Result::eSuccess);
 	}
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);

@@ -417,6 +417,18 @@ target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
 
 add_executable(build_flags_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BuildFlagsTests.cpp")
 
+add_executable(output_1080p_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/Output1080pTests.cpp")
+target_link_libraries(output_1080p_tests common)
+add_test(NAME output_1080p_default
+	COMMAND ${CMAKE_COMMAND} -E env --unset=KYTY_PERF_OUTPUT_1080P $<TARGET_FILE:output_1080p_tests>)
+add_test(NAME output_1080p_enabled
+	COMMAND ${CMAKE_COMMAND} -E env KYTY_PERF_OUTPUT_1080P=1 $<TARGET_FILE:output_1080p_tests>)
+add_test(NAME output_1080p_killed
+	COMMAND ${CMAKE_COMMAND} -E env KYTY_PERF_OUTPUT_1080P=0 $<TARGET_FILE:output_1080p_tests> --killed)
+add_test(NAME output_1080p_cli
+	COMMAND $<TARGET_FILE:kyty_emulator> --output-1080p --help)
+set_tests_properties(output_1080p_cli PROPERTIES PASS_REGULAR_EXPRESSION "Report a 1920x1080 display")
+
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PageManagerTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
@@ -578,6 +590,12 @@ add_executable(jpeg_enc_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/JpegEncTests.c
 target_link_libraries(jpeg_enc_tests common fmt::fmt)
 target_include_directories(jpeg_enc_tests PRIVATE ${inc_headers})
 
+add_executable(rendering_scope_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/RenderingScopeTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/context.cpp")
+target_link_libraries(rendering_scope_tests common fmt::fmt Vulkan::Headers ${CMAKE_DL_LIBS})
+target_include_directories(rendering_scope_tests PRIVATE ${inc_headers})
+
 add_executable(occlusion_queries_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/OcclusionQueriesTests.cpp")
 target_link_libraries(occlusion_queries_tests common fmt::fmt Vulkan::Headers)
@@ -663,6 +681,12 @@ target_link_libraries(virtual_memory_allocation_tests kyty_test_gtest)
 add_kyty_full_emulator_test(net_resolver_tests "${KYTY_TESTS_DIR}/NetResolverTests.cpp")
 target_link_libraries(net_resolver_tests kyty_test_gtest)
 
+add_executable(dlss_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DlssTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/dlss.cpp")
+target_link_libraries(dlss_tests common Vulkan::Headers SDL3::SDL3-static kyty_test_gtest)
+target_include_directories(dlss_tests PRIVATE ${inc_headers})
+
 add_executable(psml_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PsmlTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libPsml.cpp"
@@ -713,6 +737,13 @@ if(BUILD_TESTING)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME gpu_cache_budget COMMAND $<TARGET_FILE:gpu_cache_budget_tests>)
+	find_package(Python3 COMPONENTS Interpreter QUIET)
+	if(Python3_Interpreter_FOUND)
+		add_test(NAME perf_reclaim_log
+			COMMAND ${Python3_EXECUTABLE} -I "${KYTY_TESTS_DIR}/PerfReclaimLogTests.py"
+				$<TARGET_FILE:shader_cfg_tests>)
+		set_tests_properties(perf_reclaim_log PROPERTIES TIMEOUT 60)
+	endif()
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -754,6 +785,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --texture-mip-view-only)
 	add_test(NAME shader_mesh_emulation
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --mesh-emulation-only)
+	add_test(NAME shader_per_vertex_vs_store
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --vs-store-only)
 	add_test(NAME shader_portable_interpolation
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --portable-interpolation-only)
 	if(APPLE)
@@ -778,6 +811,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mul-hi24-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
+	add_test(NAME rendering_scope COMMAND $<TARGET_FILE:rendering_scope_tests>)
+	add_test(NAME rendering_scope_gpu COMMAND $<TARGET_FILE:rendering_scope_tests> --gpu)
+	set_tests_properties(rendering_scope_gpu PROPERTIES SKIP_RETURN_CODE 77)
 	add_test(NAME graphics_pipeline_rasterization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets
@@ -798,6 +834,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
 	add_test(NAME pm4_flip
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flip-only)
+	add_test(NAME video_out_flip_rate
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flip-rate-only)
 	add_test(NAME video_out_hdr10_to_sdr
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --video-out-only)
 	add_test(NAME depth_bits
@@ -847,6 +885,7 @@ if(BUILD_TESTING)
 		memory_tracker_tests
 		page_manager_tests
 		build_flags_tests
+		output_1080p_tests
 		archive_file_tests
 		image_archive_tests
 		trophy_system_tests

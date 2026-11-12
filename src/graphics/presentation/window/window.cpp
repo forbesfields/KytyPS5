@@ -29,6 +29,7 @@
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -781,6 +782,31 @@ void WindowContext::Run() {
 	}
 }
 
+#if defined(__APPLE__)
+static void ConfigureMoltenVK() {
+	const auto enabled = [](const char* name) {
+		const char* value = std::getenv(name);
+		return value == nullptr || std::string_view(value) != "0";
+	};
+	const bool defaults    = enabled("KYTY_PERF_MVK_DEFAULTS");
+	const bool async       = enabled("KYTY_PERF_MVK_ASYNC_SUBMITS");
+	const bool compression = enabled("KYTY_PERF_MVK_SHADER_COMPRESSION");
+	// Read these before SDL loads MoltenVK. Explicit driver settings always win.
+	if (defaults && async && setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0) != 0) {
+		LOGF("warning: could not set MoltenVK async submissions\n");
+	}
+	if (defaults && compression && setenv("MVK_CONFIG_SHADER_COMPRESSION_ALGORITHM", "1", 0) != 0) {
+		LOGF("warning: could not set MoltenVK shader compression\n");
+	}
+	const char* submits = std::getenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS");
+	const char* shaders = std::getenv("MVK_CONFIG_SHADER_COMPRESSION_ALGORITHM");
+	LOGF("KYTY_PERF_MVK_DEFAULTS=%d KYTY_PERF_MVK_ASYNC_SUBMITS=%d "
+	     "KYTY_PERF_MVK_SHADER_COMPRESSION=%d; driver submits=%s compression=%s\n",
+	     defaults, async, compression, submits != nullptr ? submits : "driver-default",
+	     shaders != nullptr ? shaders : "driver-default");
+}
+#endif
+
 static void WindowCreate(WindowContext& context) {
 	EXIT_IF(context.window != nullptr);
 	EXIT_IF(context.graphic_ctx.screen_width == 0);
@@ -788,6 +814,10 @@ static void WindowCreate(WindowContext& context) {
 
 	int width  = static_cast<int>(context.graphic_ctx.screen_width);
 	int height = static_cast<int>(context.graphic_ctx.screen_height);
+
+#if defined(__APPLE__)
+	ConfigureMoltenVK();
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	// RenderDoc can hide Wayland Vulkan surface support; prefer X11 for captures.
