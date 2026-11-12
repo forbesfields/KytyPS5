@@ -18,11 +18,13 @@ namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
+// Opt-in: with the ring on, Astro Bot loses the Metal device ("Invalid Resource") about 30 s
+// after launch. The ring destroys a finished pool while later Metal work can still run.
 static bool UsePoolRing() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_PERF_POOL_RING");
-		const bool use_ring = value == nullptr || std::strcmp(value, "0") != 0;
-		Log::WriteToConsoleAndLog(fmt::format("KYTY_PERF_POOL_RING={} (default: 1)\n", use_ring ? 1 : 0));
+		const bool use_ring = value != nullptr && std::strcmp(value, "1") == 0;
+		Log::WriteToConsoleAndLog(fmt::format("KYTY_PERF_POOL_RING={} (default: 0)\n", use_ring ? 1 : 0));
 		return use_ring;
 	}();
 	return enabled;
