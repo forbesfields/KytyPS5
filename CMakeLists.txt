@@ -737,6 +737,13 @@ if(BUILD_TESTING)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME gpu_cache_budget COMMAND $<TARGET_FILE:gpu_cache_budget_tests>)
+	find_package(Python3 COMPONENTS Interpreter QUIET)
+	if(Python3_Interpreter_FOUND)
+		add_test(NAME perf_reclaim_log
+			COMMAND ${Python3_EXECUTABLE} -I "${KYTY_TESTS_DIR}/PerfReclaimLogTests.py"
+				$<TARGET_FILE:shader_cfg_tests>)
+		set_tests_properties(perf_reclaim_log PROPERTIES TIMEOUT 60)
+	endif()
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)

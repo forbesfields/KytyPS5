@@ -771,6 +771,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	     db.shader_execute_on_noop || sh.AlphaToMask());
 	state.ps_active = pixel_active;
 	state.per_vertex_buffer = state.vertex_store = false;
+	if (!state.force_corner_tessellation) {
+		state.corner_tessellation_reason = CornerTessellationReason::Other;
+	}
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -986,6 +989,13 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		    ? PerVertexBufferMode(mesh_active && vertex_info[0].mesh.emulated,
 		                          !mesh_active && !tess_active && !vertex_info[0].indirect_draw)
 		    : 0u;
+		if (!state.force_corner_tessellation && pixel_info.emulate_per_vertex && per_vertex_mode == 0u) {
+			if (!PerVertexBufferEnabled() || (!mesh_active && !NativeVertexStoreEnabled())) {
+				state.corner_tessellation_reason = CornerTessellationReason::SwitchOff;
+			} else if (!mesh_active && vertex_info[0].indirect_draw) {
+				state.corner_tessellation_reason = CornerTessellationReason::Indirect;
+			}
+		}
 		state.vertex_store = per_vertex_mode == 2u;
 		state.per_vertex_buffer = per_vertex_mode != 0u;
 		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor, per_vertex_mode);
@@ -1020,6 +1030,16 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		if (capture_unsupported || !CornerBufferDescriptorsFit(
 		        m_graphics.GetPhysicalDeviceProperties().limits, vertex,
 		        *pixel_info.stage.module, state.vertex_store)) {
+			state.corner_tessellation_reason = CornerTessellationReason::Other;
+			if (capture_unsupported) {
+				const bool output_unsupported = std::ranges::any_of(info.outputs, [](const auto& output) {
+					using Kind = ShaderRecompiler::IR::StageOutputKind;
+					return output.kind != Kind::Position && output.kind != Kind::Parameter &&
+					       output.kind != Kind::ClipDistance && output.kind != Kind::Layer;
+				});
+				state.corner_tessellation_reason = output_unsupported
+				    ? CornerTessellationReason::OutputKind : CornerTessellationReason::SideEffects;
+			}
 			state.force_corner_tessellation = true;
 			GetGraphicsPrograms(command, state);
 		}

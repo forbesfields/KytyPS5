@@ -1175,6 +1175,19 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			    state.vertex_info[0].stage.module->mesh_layout.vertex_dwords, limit);
 		}
 		if (!vertex_store_plan.valid) {
+			// Invalid indices and empty draws are not a storage-capacity failure.
+			const bool valid_capture_input = supported && !indices.empty() && indices.size() % 3u == 0 &&
+			    host_draw.instance_count != 0 &&
+			    state.vertex_info[0].stage.module->mesh_layout.vertex_dwords != 0 &&
+			    std::ranges::all_of(indices, [&](uint32_t index) {
+				    const auto vertex = int64_t {index} + emit.vertex_offset;
+				    return vertex >= 0 && vertex <= INT32_MAX;
+			    });
+			state.corner_tessellation_reason = emit.indirect.address != 0
+			    ? CornerTessellationReason::Indirect
+			    : !supported ? CornerTessellationReason::PrimitiveRestart
+			    : valid_capture_input ? CornerTessellationReason::CaptureRange
+			                          : CornerTessellationReason::Other;
 			state.force_corner_tessellation = true;
 			m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
 			tessellation = true;
@@ -1387,6 +1400,28 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		buffer.EndRendering();
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
+	const auto record_tessellation_reason = [&] {
+		using Common::DebugCounters::Add;
+		using Common::DebugCounters::Counter;
+		if (vertex_stages.size() == 3) {
+			Add(Counter::TessellationPatches);
+		} else if (!mesh_active && Prospero::IsRectList(ucfg.GetPrimType())) {
+			Add(Counter::TessellationRectangles);
+		} else {
+			Add(Counter::TessellationCorners);
+			Counter reason = Counter::CornerFallbackOther;
+			switch (state.corner_tessellation_reason) {
+				case CornerTessellationReason::Indirect: reason = Counter::CornerFallbackIndirect; break;
+				case CornerTessellationReason::PrimitiveRestart: reason = Counter::CornerFallbackRestart; break;
+				case CornerTessellationReason::CaptureRange: reason = Counter::CornerFallbackCaptureRange; break;
+				case CornerTessellationReason::OutputKind: reason = Counter::CornerFallbackOutputKind; break;
+				case CornerTessellationReason::SideEffects: reason = Counter::CornerFallbackSideEffects; break;
+				case CornerTessellationReason::SwitchOff: reason = Counter::CornerFallbackSwitchOff; break;
+				case CornerTessellationReason::Other: break;
+			}
+			Add(reason);
+		}
+	};
 	if (emulated_mesh) {
 		EXIT_IF(pipeline.mesh_compute_pipeline == nullptr || mesh_task);
 		auto& storage = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::DeviceLocal);
@@ -1423,6 +1458,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 					vk_buffer.draw(count * mesh.max_primitives * 3u, instances, 0u, 0u);
 					if (tessellation) {
 						m_context.RecordTessellationDraw(count * mesh.max_primitives * 3u, instances);
+						record_tessellation_reason();
+					} else if (state.per_vertex_buffer) {
+						Common::DebugCounters::Add(Common::DebugCounters::Counter::MeshBufferDraws);
 					}
 					queries.End(vk_buffer, query);
 					buffer.EndRendering();
@@ -1456,6 +1494,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 					vk_buffer.draw(count * mesh.max_primitives * 3u, 1u, 0u, 0u);
 					if (tessellation) {
 						m_context.RecordTessellationDraw(count * mesh.max_primitives * 3u, 1u);
+						record_tessellation_reason();
+					} else if (state.per_vertex_buffer) {
+						Common::DebugCounters::Add(Common::DebugCounters::Counter::MeshBufferDraws);
 					}
 					queries.End(vk_buffer, query);
 					buffer.EndRendering();
@@ -1526,6 +1567,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (tessellation) {
 		m_context.RecordTessellationDraw(host_draw.index_count, draw.instance_count,
 		                                emit.indirect.address != 0);
+		record_tessellation_reason();
+	} else if (state.vertex_store) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::VsStoreNativeDraws);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);

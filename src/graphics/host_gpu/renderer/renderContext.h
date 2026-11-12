@@ -38,6 +38,8 @@ public:
 	~RenderContext();
 	KYTY_CLASS_NO_COPY(RenderContext);
 
+	// Read driver usage at the log window end, with renderer lifetime protection.
+	[[nodiscard]] static std::optional<uint64_t> ReadPerfDriverBytes();
 	[[nodiscard]] GraphicContext&           GetGraphics() const noexcept { return m_graphics; }
 	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
 	void                                    ShutdownGpu();

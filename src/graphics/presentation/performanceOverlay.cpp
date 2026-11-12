@@ -5,6 +5,7 @@
 #include "common/hostStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "imgui.h"
 #include "kernel/memory.h"
 
@@ -24,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -40,10 +42,41 @@ bool PerfLogEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_PERF_LOG");
 		const bool on = value != nullptr && std::string_view(value) == "1";
+		Common::DebugCounters::SetPerfEnabled(on);
 		std::printf("KYTY_PERF_LOG=%d\n", on);
 		return on;
 	}();
 	return enabled;
+}
+
+constexpr std::array PERF_COUNTERS {
+	std::pair {Counter::PoolReclaimsDraw, "pool_draw"},
+	std::pair {Counter::PoolReclaimsFrame, "pool_frame"},
+	std::pair {Counter::PoolReclaimsPressure, "pool_pressure"},
+	std::pair {Counter::TessellationDraws, "tess_draws"},
+	std::pair {Counter::TessellationVertices, "tess_vertices"},
+	std::pair {Counter::TessellationIndirectDraws, "tess_indirect_draws"},
+	std::pair {Counter::TessellationPatches, "tess_patch"},
+	std::pair {Counter::TessellationRectangles, "tess_rect"},
+	std::pair {Counter::TessellationCorners, "tess_corner"},
+	std::pair {Counter::CornerFallbackIndirect, "corner_indirect"},
+	std::pair {Counter::CornerFallbackRestart, "corner_restart"},
+	std::pair {Counter::CornerFallbackCaptureRange, "corner_capture_range"},
+	std::pair {Counter::CornerFallbackOutputKind, "corner_output_kind"},
+	std::pair {Counter::CornerFallbackSideEffects, "corner_side_effects"},
+	std::pair {Counter::CornerFallbackSwitchOff, "corner_switch_off"},
+	std::pair {Counter::CornerFallbackOther, "corner_other"},
+	std::pair {Counter::VsStoreNativeDraws, "vs_store_native"},
+	std::pair {Counter::MeshBufferDraws, "mesh_buffer"},
+};
+using PerfCounterTotals = std::array<uint64_t, static_cast<size_t>(Counter::Count)>;
+
+PerfCounterTotals ReadPerfCounters() {
+	PerfCounterTotals result {};
+	for (size_t i = 0; i < result.size(); ++i) {
+		result[i] = Common::DebugCounters::Get(static_cast<Counter>(i));
+	}
+	return result;
 }
 
 struct PerfLog {
@@ -53,12 +86,14 @@ struct PerfLog {
 	Clock::time_point   last_flip {};
 	uint64_t            total_frames = 0;
 	std::vector<double> intervals_ms;
+	PerfCounterTotals   counter_totals {};
 
 	void Record() {
 		std::scoped_lock lock(mutex);
 		const auto now = Clock::now();
 		if (last_flip == Clock::time_point {}) {
 			start = window_start = now;
+			counter_totals = ReadPerfCounters();
 		} else {
 			intervals_ms.push_back(std::chrono::duration<double, std::milli>(now - last_flip).count());
 		}
@@ -77,11 +112,15 @@ struct PerfLog {
 		const double unix_s = std::chrono::duration<double>(
 		    std::chrono::system_clock::now().time_since_epoch()).count();
 		const auto frames = total_frames;
+		const auto totals = ReadPerfCounters();
+		const auto previous = counter_totals;
+		counter_totals = totals;
 		std::vector<double> samples;
 		samples.swap(intervals_ms);
 		window_start = now;
 		// Sort and write outside the flip lock. Log I/O must not block a frame.
 		lock.unlock();
+		const auto driver_bytes = RenderContext::ReadPerfDriverBytes();
 		double sum = 0.0;
 		for (double ms: samples) {
 			sum += ms;
@@ -103,7 +142,16 @@ struct PerfLog {
 			}
 			line += fmt::format("{:.6f}", samples[i]);
 		}
-		line += "]}\n";
+		line += ']';
+		for (const auto& [counter, name]: PERF_COUNTERS) {
+			const auto index = static_cast<size_t>(counter);
+			line += fmt::format(",\"{}\":{}", name, totals[index] - previous[index]);
+		}
+		const auto timing = static_cast<size_t>(Counter::PoolRecreateNs);
+		line += fmt::format(",\"pool_recreate_ms\":{:.6f},\"driver_mib\":{}}}\n",
+		    static_cast<double>(totals[timing] - previous[timing]) / 1e6,
+		    driver_bytes ? fmt::format("{:.6f}", static_cast<double>(*driver_bytes) / (1024 * 1024))
+		                 : "null");
 		std::fwrite(line.data(), 1, line.size(), stdout);
 		std::fflush(stdout);
 	}

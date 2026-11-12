@@ -322,6 +322,7 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::RecreateCommandPool() {
+	const Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PoolRecreateNs);
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();

@@ -1,3 +1,4 @@
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -11,6 +12,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -40,6 +42,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +53,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -13795,6 +13799,31 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--perf-reclaim-log-only") == 0) {
+    using namespace Common::DebugCounters;
+    using namespace std::chrono_literals;
+    Check(!Enabled(), "performance log fixture needs a hidden overlay");
+    PerformanceOverlayRecordFlip(1920, 1080);
+    Check(Collecting(), "KYTY_PERF_LOG=1 must collect with the overlay hidden");
+    // One event for each exported counter. The next idle window must contain zero.
+    for (auto counter: {Counter::PoolReclaimsDraw, Counter::PoolReclaimsFrame,
+         Counter::PoolReclaimsPressure, Counter::TessellationDraws,
+         Counter::TessellationVertices, Counter::TessellationIndirectDraws,
+         Counter::TessellationPatches, Counter::TessellationRectangles,
+         Counter::TessellationCorners, Counter::CornerFallbackIndirect,
+         Counter::CornerFallbackRestart, Counter::CornerFallbackCaptureRange,
+         Counter::CornerFallbackOutputKind, Counter::CornerFallbackSideEffects,
+         Counter::CornerFallbackSwitchOff, Counter::CornerFallbackOther,
+         Counter::VsStoreNativeDraws, Counter::MeshBufferDraws}) Add(counter, 7);
+    Add(Counter::PoolRecreateNs, 125000000);
+    // Hiding an open overlay must keep log collection active.
+    TogglePerformanceOverlay();
+    TogglePerformanceOverlay();
+    std::this_thread::sleep_for(12s);
+    Check(!Enabled() && Collecting(), "overlay toggle stopped log collection");
+    std::puts("Perf reclaim log fixture: two idle windows emitted");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--vertex-launch-only") == 0) {
     TestUnsignedLaunchRanges();
     TestNggVertexEntryState();

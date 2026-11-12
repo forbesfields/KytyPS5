@@ -9,8 +9,37 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
+#include <mutex>
 
 namespace Libs::Graphics {
+
+namespace {
+std::mutex g_perf_graphics_mutex;
+const GraphicContext* g_perf_graphics = nullptr;
+
+const TessellationReclaimPolicy& ReclaimPolicy() {
+	static const auto policy = [] {
+		const auto result = TessellationReclaimPolicy::Parse(
+		    std::getenv("KYTY_PERF_TESS_RECLAIM_VERTICES"),
+		    std::getenv("KYTY_PERF_TESS_RECLAIM_HARD_VERTICES"),
+		    std::getenv("KYTY_PERF_RECLAIM_AT_FRAME"));
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "KYTY_PERF_TESS_RECLAIM_VERTICES={} KYTY_PERF_TESS_RECLAIM_HARD_VERTICES={} "
+		    "KYTY_PERF_RECLAIM_AT_FRAME={} (legacy pool only)\n",
+		    result.vertices, result.hard_vertices, result.at_frame ? 1 : 0));
+		return result;
+	}();
+	return policy;
+}
+} // namespace
+
+std::optional<uint64_t> RenderContext::ReadPerfDriverBytes() {
+	// Do not let the sampler use the allocator after renderer teardown.
+	std::scoped_lock lock(g_perf_graphics_mutex);
+	return g_perf_graphics != nullptr && g_perf_graphics->CanReportMemoryUsage()
+	    ? std::optional(g_perf_graphics->GetUnifiedMemoryUsage().driver_bytes) : std::nullopt;
+}
 
 RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::path& shader_store)
     : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
@@ -19,7 +48,7 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler),
-      m_unified_cache_limit(graphics.GetUnifiedCacheLimit()) {
+      m_unified_cache_limit(graphics.GetUnifiedCacheLimit()), m_tessellation_batch(ReclaimPolicy()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	if (m_unified_cache_limit) {
 		vk::PhysicalDeviceDriverProperties driver {};
@@ -30,9 +59,15 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
 		Log::WriteToConsoleAndLog(fmt::format("Unified GPU cache budget: {} MiB\n",
 		                                      *m_unified_cache_limit / (1024 * 1024)));
 	}
+	std::scoped_lock lock(g_perf_graphics_mutex);
+	g_perf_graphics = &graphics;
 }
 
 RenderContext::~RenderContext() {
+	{
+		std::scoped_lock lock(g_perf_graphics_mutex);
+		g_perf_graphics = nullptr;
+	}
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
 }
@@ -170,9 +205,10 @@ void RenderContext::PrepareBda() {
 
 void RenderContext::PrepareDraw() {
 	const bool use_ring = m_command_scheduler.PoolRingEnabled();
-	if (!m_reclaim_metal_pool || !m_tessellation_batch.NeedsReclaim(use_ring)) {
+	if (!m_reclaim_metal_pool || !m_tessellation_batch.NeedsDrawReclaim(use_ring)) {
 		return;
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::PoolReclaimsDraw);
 	if (use_ring) {
 		// Rotation is asynchronous. Sample driver bytes at the frame boundary,
 		// where completed pools have been collected, instead of around each rotation.
@@ -192,6 +228,15 @@ void RenderContext::PrepareDraw() {
 }
 
 void RenderContext::RecordTessellationDraw(uint32_t vertices, uint32_t instances, bool indirect) {
+	using Common::DebugCounters::Add;
+	using Common::DebugCounters::Counter;
+	Add(Counter::TessellationDraws);
+	if (indirect) {
+		Add(Counter::TessellationIndirectDraws);
+	} else {
+		// Input vertices times instances. GPU-only indirect counts are unknown.
+		Add(Counter::TessellationVertices, uint64_t {vertices} * instances);
+	}
 	if (m_reclaim_metal_pool) {
 		if (indirect) {
 			m_tessellation_batch.RecordIndirect();
@@ -216,10 +261,15 @@ void RenderContext::RunGarbageCollector() {
 		auto usage = m_graphics.GetUnifiedMemoryUsage();
 		GpuCacheBudget budget {usage.driver_bytes, *m_unified_cache_limit,
 		                       GraphicContext::GetHostCachePressure()};
-		if (m_reclaim_metal_pool &&
-		    (m_tessellation_batch.NeedsFrameReclaim(m_command_scheduler.PoolRingEnabled()) ||
-		     budget.ShouldReclaimDriverPool(usage.allocator_block_bytes,
-		         std::chrono::steady_clock::now() - m_last_pool_reclaim))) {
+		const bool frame_reclaim =
+		    m_tessellation_batch.NeedsFrameReclaim(m_command_scheduler.PoolRingEnabled());
+		const bool pressure_reclaim = budget.ShouldReclaimDriverPool(usage.allocator_block_bytes,
+		    std::chrono::steady_clock::now() - m_last_pool_reclaim);
+		if (m_reclaim_metal_pool && (frame_reclaim || pressure_reclaim)) {
+			// Attribute each recreation once. Pressure takes priority if both triggers fire.
+			Common::DebugCounters::Add(pressure_reclaim
+			    ? Common::DebugCounters::Counter::PoolReclaimsPressure
+			    : Common::DebugCounters::Counter::PoolReclaimsFrame);
 			const auto before = usage;
 			m_command_scheduler.RecreateCommandPool();
 			m_tessellation_batch.Reset();

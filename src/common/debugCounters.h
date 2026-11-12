@@ -9,8 +9,8 @@ namespace Common::DebugCounters {
 
 static_assert(std::atomic<uint64_t>::is_always_lock_free && std::atomic<bool>::is_always_lock_free);
 
-// Collect events only while the panel is visible. Relaxed, lock-free atomics keep updates
-// cheap and safe in signal handlers. Rates come from comparing two snapshots.
+// Collect while the panel or the performance log is enabled. Relaxed, lock-free
+// atomics keep updates cheap and safe in signal handlers. Rates use two snapshots.
 enum class Counter {
 	// GPU work.
 	Draws,
@@ -25,6 +25,25 @@ enum class Counter {
 	InPassClears,
 	AttachmentStoresSkipped,
 	QueueSubmits,
+	PoolReclaimsDraw,
+	PoolReclaimsFrame,
+	PoolReclaimsPressure,
+	PoolRecreateNs,
+	TessellationDraws,
+	TessellationVertices, // Known input vertices times instances, before tessellation expansion.
+	TessellationIndirectDraws, // Vertex counts are GPU-only; excluded from TessellationVertices.
+	TessellationPatches,
+	TessellationRectangles,
+	TessellationCorners,
+	CornerFallbackIndirect,
+	CornerFallbackRestart,
+	CornerFallbackCaptureRange,
+	CornerFallbackOutputKind,
+	CornerFallbackSideEffects,
+	CornerFallbackSwitchOff,
+	CornerFallbackOther,
+	VsStoreNativeDraws,
+	MeshBufferDraws,
 	GpuWaits, // CPU blocked on a GPU timeline semaphore.
 	GpuWaitNs,
 	GpuFaults, // Guest writes to GPU-tracked memory.
@@ -66,6 +85,7 @@ enum class Peak { ShaderCompileNs, PipelineCreateNs, Count };
 
 namespace Detail {
 inline std::atomic<bool>     g_enabled {false};
+inline std::atomic<bool>     g_perf_enabled {false};
 inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
 inline std::atomic<uint64_t> g_peaks[static_cast<int>(Peak::Count)] {};
 } // namespace Detail
@@ -78,8 +98,16 @@ inline void SetEnabled(bool enabled) noexcept {
 	Detail::g_enabled.store(enabled, std::memory_order_relaxed);
 }
 
+inline void SetPerfEnabled(bool enabled) noexcept {
+	Detail::g_perf_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline bool Collecting() noexcept {
+	return Enabled() || Detail::g_perf_enabled.load(std::memory_order_relaxed);
+}
+
 inline void Add(Counter counter, uint64_t value = 1) noexcept {
-	if (!Enabled()) {
+	if (!Collecting()) {
 		return;
 	}
 	Detail::g_counters[static_cast<int>(counter)].fetch_add(value, std::memory_order_relaxed);
@@ -90,10 +118,10 @@ public:
 	explicit ScopedTimer(Counter duration): ScopedTimer(Counter::Count, duration) {}
 	ScopedTimer(Counter count, Counter duration, Peak peak = Peak::Count)
 	    : m_count(count), m_duration(duration), m_peak(peak),
-	      m_start(Enabled() ? std::chrono::steady_clock::now()
-	                        : std::chrono::steady_clock::time_point {}) {}
+	      m_start(Collecting() ? std::chrono::steady_clock::now()
+	                           : std::chrono::steady_clock::time_point {}) {}
 	~ScopedTimer() {
-		if (m_start == std::chrono::steady_clock::time_point {} || !Enabled()) {
+		if (m_start == std::chrono::steady_clock::time_point {} || !Collecting()) {
 			return;
 		}
 		const auto elapsed =

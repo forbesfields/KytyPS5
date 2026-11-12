@@ -143,6 +143,10 @@ struct DrawTargets {
 	uint32_t        color_count = 0;
 };
 
+enum class CornerTessellationReason {
+	Other, Indirect, PrimitiveRestart, CaptureRange, OutputKind, SideEffects, SwitchOff
+};
+
 // A draw's topology and shader stages (from PipelineCache::GetGraphicsPrograms).
 struct DrawRenderState {
 	// Color targets the pixel program writes.
@@ -154,6 +158,7 @@ struct DrawRenderState {
 	bool                                 vertex_store                             = false;
 	// Retry draws that do not fit the capture buffer with the old tessellation interface.
 	bool                                 force_corner_tessellation                = false;
+	CornerTessellationReason              corner_tessellation_reason = CornerTessellationReason::Other;
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo                 ps_input_info;
 	// Input: the user-data slots a GPU-read indirect draw patches.
